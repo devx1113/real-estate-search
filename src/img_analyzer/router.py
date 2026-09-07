@@ -36,7 +36,8 @@ async def _ingest_items(items: list[PropertyInput]) -> dict:
                 item_id, data = str(it.id), it.data or {}
                 if is_mls_record(data):
                     # MLS/RESO record: rewrite to the internal shape; the row id
-                    # becomes the stable SparkId/ListingKey.
+                    # becomes the wrapper's exporter GUID (shared with the
+                    # frontend DB), falling back to SparkId/ListingKey.
                     item_id, data = transform_mls(data, fallback_id=item_id)
                     if not item_id or set(item_id) <= {"0", "-"}:
                         # No SparkId/ListingKey and the wrapper id is the zero
@@ -87,7 +88,12 @@ async def process_properties(items: list[PropertyInput] = Body(...)):
 
 @router.post("/process/upload", status_code=202)
 async def process_properties_upload(file: UploadFile = File(...)):
-    """Like POST /process but payload is an uploaded JSON file (field `file`): array of {id, data}."""
+    """Like POST /process but payload is an uploaded JSON file (field `file`): array of {id, data}.
+
+    `id` is the exporter's GUID shared with the frontend database; `data` is the
+    raw MLS/RESO record. A bare array of MLS records (no wrapper) is also
+    accepted — each record is then keyed by its own SparkId/ListingKey.
+    """
     raw = await file.read()
     try:
         payload = json.loads(raw)

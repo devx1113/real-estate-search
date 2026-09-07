@@ -42,43 +42,66 @@ class PhotoResult(BaseModel):
 
 
 class PropertyInput(BaseModel):
-    """POST /process item: id (GUID) + full Zillow property record."""
+    """POST /process item.
+
+    - `id`: the exporter-generated GUID for this listing — the SAME GUID the
+      frontend database uses, byte-identical on every re-upload of the listing
+      (updates, status changes). Search responses return it as `propertyId`.
+    - `data`: the raw MLS/RESO record exactly as exported (ListingKey,
+      StandardStatus, ListPrice, Photos, ...). MLS records are detected and
+      mapped automatically. Re-uploads of the same GUID are treated as updates:
+      only new photos are analyzed, and a non-Active StandardStatus removes the
+      listing from search. (The legacy internal/Zillow record shape is also
+      still accepted.)
+    """
     id: str
     data: dict
 
     model_config = {
         "json_schema_extra": {
             "example": {
-                "id": "abc-123-def-456",
+                "id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
                 "data": {
-                    "address": {
-                        "streetAddress": "123 Main St",
-                        "city": "Titusville",
-                        "state": "FL",
-                        "zipcode": "32796",
-                        "subdivision": "Sample Subdivision",
-                    },
-                    "latitude": 28.6,
-                    "longitude": -80.8,
-                    "price": 500000,
-                    "bedrooms": 3,
-                    "bathrooms": 2,
-                    "livingArea": 1800,
-                    "homeType": "SINGLE_FAMILY",
-                    "yearBuilt": 1995,
-                    "description": "...",
-                    "originalPhotos": [
-                        {"mixedSources": {"jpeg": [{"url": "https://...", "width": 1536}]}}
+                    "ListingKey": "20231009143746930668000000",
+                    "SparkId": "20231009143746930668000000",
+                    "ListingId": "973477",
+                    "StandardStatus": "Active",
+                    "ListPrice": 255000,
+                    "StreetNumber": "528",
+                    "StreetName": "Clearview",
+                    "StreetSuffix": "Drive",
+                    "City": "Cocoa",
+                    "StateOrProvince": "FL",
+                    "PostalCode": "32927",
+                    "CountyOrParish": "Brevard",
+                    "SubdivisionName": "Sample Subdivision",
+                    "Latitude": 28.4,
+                    "Longitude": -80.8,
+                    "BedroomsTotal": 3,
+                    "BathroomsTotalInteger": 2,
+                    "LivingArea": 1428,
+                    "PropertySubType": "Manufactured Home",
+                    "YearBuilt": 1985,
+                    "PublicRemarks": "...",
+                    "PoolYN": False,
+                    "WaterFrontYN": False,
+                    "GarageSpaces": 2,
+                    "ElementarySchool": "Example Elementary",
+                    "MiddleOrJuniorSchool": "Example Middle",
+                    "HighSchool": "Example High",
+                    "StandardFieldsJson": "{\"ListingTerms\": {\"Cash\": true, \"Conventional\": true, \"FHA\": true}}",
+                    "Photos": [
+                        {
+                            "DisplayOrder": 0,
+                            "Caption": "",
+                            "Uri300": "https://.../300.jpg",
+                            "Uri800": "https://.../800.jpg",
+                            "Uri1024": "https://.../1024.jpg",
+                            "Uri1600": "https://.../1600.jpg",
+                            "Uri2048": "https://.../2048.jpg",
+                            "UriLarge": "https://.../large.jpg",
+                        }
                     ],
-                    "schools": [
-                        {"name": "Example School", "rating": 8, "grades": "K-5", "distance": 0.6, "link": "..."}
-                    ],
-                    "resoFacts": {
-                        "stories": 1,
-                        "hasPrivatePool": True,
-                        "hasWaterfrontView": False,
-                        "listingTerms": "Cash,Conventional,FHA"
-                    },
                 },
             }
         }
