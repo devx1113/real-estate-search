@@ -16,6 +16,9 @@ Mapping decisions (documented in the 2026-09 field audit):
   listing are adopted as updates instead of duplicating.
 - status: StandardStatus -> homeStatus (Active=FOR_SALE; everything else maps to
   a non-FOR_SALE value and is pruned/parked by the existing catalog rule).
+  Listing CLASS (StandardFieldsJson.PropertyClass) then narrows Active further:
+  rentals -> FOR_RENT, land/commercial -> OTHER, so only residential homes for
+  sale ever enter the catalog (a $1,800 rental or an empty lot is not a home).
 - photos: Photos[] sorted by DisplayOrder -> originalPhotos with a width ladder;
   the highest-width URL is the canonical id room_instances keys on, so it must
   be stable across re-uploads (plain URL passthrough, no rewriting).
@@ -34,6 +37,24 @@ import logging
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
+
+# StandardFieldsJson.PropertyClass (Spark) -> listing class. Only residential
+# FOR-SALE listings belong in the catalog: rentals carry a MONTHLY price and
+# land/commercial have no rooms — all three would surface as absurd "homes".
+_CLASS_BY_LABEL = {
+    "residential": "residential",
+    "rental": "rental",
+    "residential lease": "rental",
+    "land": "land",
+    "commercial": "commercial",
+    "commercial lease": "commercial",
+    "commercial sale": "commercial",
+    "business opportunity": "commercial",
+}
+# Spark PropertyType letter codes seen in the feed, fallback when the
+# StandardFieldsJson labels are absent.
+_CLASS_BY_CODE = {"A": "residential", "B": "residential", "C": "land",
+                  "E": "commercial", "F": "rental"}
 
 _STATUS_MAP = {
     "active": "FOR_SALE",
@@ -61,6 +82,8 @@ _TYPE_MAP = [
     ("quadruplex", "MULTI_FAMILY"),
     ("multi family", "MULTI_FAMILY"),
     ("multi-family", "MULTI_FAMILY"),
+    ("apartment", "CONDO"),
+    ("villa", "TOWNHOUSE"),
 ]
 
 # (uri key, width for the jpeg ladder). UriLarge is the original upload — widest.
@@ -88,6 +111,14 @@ def is_mls_record(data: dict) -> bool:
         and "StandardStatus" in data
         and "homeStatus" not in data
     )
+
+
+def _listing_class(data: dict, sf: dict) -> str | None:
+    for label in (sf.get("PropertyClass"), sf.get("PropertyTypeLabel")):
+        cls = _CLASS_BY_LABEL.get(str(label or "").strip().lower())
+        if cls:
+            return cls
+    return _CLASS_BY_CODE.get(str(data.get("PropertyType") or "").strip().upper())
 
 
 def _home_type(sub_type: str | None, type_label: str | None) -> str | None:
@@ -181,6 +212,17 @@ def transform_mls(data: dict, fallback_id: str = "") -> tuple[str, dict]:
     """MLS record -> (raw-row id, internal-shaped record)."""
     sf = _standard_fields(data)
     status = _STATUS_MAP.get(str(data.get("StandardStatus") or "").strip().lower(), "OTHER")
+    listing_class = _listing_class(data, sf)
+    if status == "FOR_SALE" and listing_class == "rental":
+        status = "FOR_RENT"
+    elif status == "FOR_SALE" and listing_class in ("land", "commercial"):
+        status = "OTHER"
+    home_type = _home_type(data.get("PropertySubType"), sf.get("PropertyTypeLabel"))
+    if status == "FOR_SALE" and home_type is None:
+        logger.warning(
+            "MLS %s: unmapped PropertySubType %r (class=%s) -> home_type NULL",
+            data.get("ListingId"), data.get("PropertySubType"), listing_class,
+        )
     county = str(data.get("CountyOrParish") or "").strip()
     if county and not county.lower().endswith("county"):
         county = f"{county} County"
@@ -214,7 +256,8 @@ def transform_mls(data: dict, fallback_id: str = "") -> tuple[str, dict]:
         "bedrooms": data.get("BedroomsTotal"),
         "bathrooms": baths,
         "livingArea": data.get("LivingArea"),
-        "homeType": _home_type(data.get("PropertySubType"), sf.get("PropertyTypeLabel")),
+        "homeType": home_type,
+        "listingClass": listing_class,
         "yearBuilt": data.get("YearBuilt"),
         "description": data.get("PublicRemarks"),
         "county": county or None,
