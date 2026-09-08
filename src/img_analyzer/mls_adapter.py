@@ -24,9 +24,15 @@ Mapping decisions (documented in the 2026-09 field audit):
   exporter nulls it (directions, condo UnitNumber). Duplicated suffix/direction
   words and unit markers ("#", "Unit") are normalized so the stored form is
   what the exact-address matcher expects.
-- photos: Photos[] sorted by DisplayOrder -> originalPhotos with a width ladder;
-  the highest-width URL is the canonical id room_instances keys on, so it must
-  be stable across re-uploads (plain URL passthrough, no rewriting).
+- key casing: Spark emits RESO PascalCase, the exporter's serializer may emit
+  camelCase (sparkId, standardStatus, photos) — every lookup is case-insensitive,
+  and any flat field the exporter nulls falls back to the embedded
+  StandardFieldsJson (the original Spark record).
+- photos: Photos[] (primary first, then DisplayOrder) -> originalPhotos with a
+  width ladder; the highest-width URL is the canonical id room_instances keys
+  on, so it must be stable across re-uploads (plain URL passthrough, no
+  rewriting). When the top-level photos[] arrives empty, the Photos[] embedded
+  in StandardFieldsJson is used instead.
 - schools: MLS carries NAMES only. We deliberately emit an empty `schools` list
   (no property_schools rows with fake distances) and stash the names under
   `mlsSchools` for the later ratings backfill — school queries return empty,
@@ -44,6 +50,47 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
+
+class _CI(dict):
+    """Read view over a record with case-insensitive keys: Spark emits RESO
+    PascalCase (StandardStatus, Uri800), the exporter's serializer may emit
+    camelCase (standardStatus, uri800). Iteration/items keep the original keys."""
+
+    def __init__(self, d: dict):
+        super().__init__(d)
+        self._idx = {str(k).lower(): k for k in d}
+
+    def get(self, key, default=None):
+        k = self._idx.get(str(key).lower())
+        return dict.get(self, k, default) if k is not None else default
+
+    def __contains__(self, key) -> bool:
+        return str(key).lower() in self._idx
+
+
+def _ci(d) -> _CI:
+    if isinstance(d, _CI):
+        return d
+    return _CI(d if isinstance(d, dict) else {})
+
+
+def _merged(flat: _CI, sf: _CI) -> _CI:
+    """One read view per field: the exporter's flat value wins when present; a
+    null/empty flat value falls back to the embedded StandardFieldsJson (the
+    original Spark record — e.g. flat unitNumber=null while UnitNumber='2101')."""
+    out: dict = dict(sf)
+    idx = {str(k).lower(): k for k in out}
+    for k, v in flat.items():
+        if v is None or v == "":
+            continue
+        old = idx.get(str(k).lower())
+        if old is not None and old != k:
+            out.pop(old, None)
+        out[k] = v
+        idx[str(k).lower()] = k
+    return _CI(out)
+
+
 # StandardFieldsJson.PropertyClass (Spark) -> listing class. Only residential
 # FOR-SALE listings belong in the catalog: rentals carry a MONTHLY price and
 # land/commercial have no rooms — all three would surface as absurd "homes".
@@ -60,7 +107,7 @@ _CLASS_BY_LABEL = {
 # Spark PropertyType letter codes seen in the feed, fallback when the
 # StandardFieldsJson labels are absent.
 _CLASS_BY_CODE = {"A": "residential", "B": "residential", "C": "land",
-                  "E": "commercial", "F": "rental"}
+                  "D": "commercial", "E": "commercial", "F": "rental"}
 
 _STATUS_MAP = {
     "active": "FOR_SALE",
@@ -104,19 +151,17 @@ _PHOTO_URIS = [
 
 # Media arrays are transformed (photos) or irrelevant; keeping the raw copies too
 # would double every record's footprint for no reader.
-_MLS_KEEP_SKIP = {"Photos", "FloorPlans", "Documents", "Videos", "VirtualTours",
-                  "OpenHouses", "DomainEvents"}
+_MLS_KEEP_SKIP = {"photos", "floorplans", "documents", "videos", "virtualtours",
+                  "openhouses", "domainevents"}  # compared lower-cased
 
 
 def is_mls_record(data: dict) -> bool:
     """An MLS/RESO record carries ListingKey/SparkId + StandardStatus; the
     internal shape never does."""
-    return (
-        isinstance(data, dict)
-        and ("ListingKey" in data or "SparkId" in data)
-        and "StandardStatus" in data
-        and "homeStatus" not in data
-    )
+    if not isinstance(data, dict):
+        return False
+    d = _ci(data)
+    return ("ListingKey" in d or "SparkId" in d) and "StandardStatus" in d and "homeStatus" not in d
 
 
 def _listing_class(data: dict, sf: dict) -> str | None:
@@ -181,12 +226,16 @@ def _street(d: dict, sf: dict | None = None) -> str:
     return street
 
 
-def _photos(d: dict) -> list[dict]:
+def _photos(d: dict, sf: dict | None = None) -> list[dict]:
+    # The exporter's top-level photos[] can arrive EMPTY while the embedded
+    # StandardFieldsJson still carries the full Spark Photos[] — fall back to it.
+    raw = d.get("Photos") or (sf or {}).get("Photos") or []
+    photos = [_ci(p) for p in raw if isinstance(p, dict)]
+    photos = [p for p in photos if p.get("IsActive", True)]
+    # Primary photo first, then DisplayOrder; stable sort keeps feed order otherwise.
+    photos.sort(key=lambda p: (not bool(p.get("Primary")),
+                               p.get("DisplayOrder") is None, p.get("DisplayOrder") or 0))
     out = []
-    photos = sorted(
-        (p for p in (d.get("Photos") or []) if isinstance(p, dict) and p.get("IsActive", True)),
-        key=lambda p: (p.get("DisplayOrder") is None, p.get("DisplayOrder", 0)),
-    )
     for p in photos:
         seen: set[str] = set()
         jpeg = []
@@ -219,11 +268,14 @@ def _days_on_market(d: dict, home_status: str) -> int | None:
 
 
 def _standard_fields(d: dict) -> dict:
+    raw = d.get("StandardFieldsJson")
+    if isinstance(raw, dict):  # already an object, not a JSON string
+        return _ci(raw)
     try:
-        sf = json.loads(d.get("StandardFieldsJson") or "{}")
-        return sf if isinstance(sf, dict) else {}
+        sf = json.loads(raw or "{}")
+        return _ci(sf if isinstance(sf, dict) else {})
     except (json.JSONDecodeError, TypeError):
-        return {}
+        return _ci({})
 
 
 def _listing_terms(data: dict, sf: dict) -> str | None:
@@ -243,7 +295,9 @@ def _listing_terms(data: dict, sf: dict) -> str | None:
 
 def transform_mls(data: dict, fallback_id: str = "") -> tuple[str, dict]:
     """MLS record -> (raw-row id, internal-shaped record)."""
-    sf = _standard_fields(data)
+    orig = _ci(data)
+    sf = _standard_fields(orig)
+    data = _merged(orig, sf)
     status = _STATUS_MAP.get(str(data.get("StandardStatus") or "").strip().lower(), "OTHER")
     listing_class = _listing_class(data, sf)
     if status == "FOR_SALE" and listing_class == "rental":
@@ -313,9 +367,9 @@ def transform_mls(data: dict, fallback_id: str = "") -> tuple[str, dict]:
             "middle": data.get("MiddleOrJuniorSchool"),
             "high": data.get("HighSchool"),
         },
-        "originalPhotos": _photos(data),
+        "originalPhotos": _photos(data, sf),
         # Everything the mapping does not consume, preserved for future features.
-        "mls": {k: v for k, v in data.items() if k not in _MLS_KEEP_SKIP},
+        "mls": {k: v for k, v in orig.items() if str(k).lower() not in _MLS_KEEP_SKIP},
     }
     if data.get("LotSizeSquareFeet") is not None:
         record["lotSize"] = data.get("LotSizeSquareFeet")
