@@ -19,6 +19,11 @@ Mapping decisions (documented in the 2026-09 field audit):
   Listing CLASS (StandardFieldsJson.PropertyClass) then narrows Active further:
   rentals -> FOR_RENT, land/commercial -> OTHER, so only residential homes for
   sale ever enter the catalog (a $1,800 rental or an empty lot is not a home).
+- address: number, direction, name, suffix, direction, "APT unit" — each part
+  taken from the flat record, falling back to StandardFieldsJson when the
+  exporter nulls it (directions, condo UnitNumber). Duplicated suffix/direction
+  words and unit markers ("#", "Unit") are normalized so the stored form is
+  what the exact-address matcher expects.
 - photos: Photos[] sorted by DisplayOrder -> originalPhotos with a width ladder;
   the highest-width URL is the canonical id room_instances keys on, so it must
   be stable across re-uploads (plain URL passthrough, no rewriting).
@@ -34,6 +39,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
@@ -129,22 +135,49 @@ def _home_type(sub_type: str | None, type_label: str | None) -> str | None:
     return None
 
 
-def _street(d: dict) -> str:
-    parts = [d.get("StreetDirPrefix"), d.get("StreetNumber"), d.get("StreetName"),
-             d.get("StreetSuffix"), d.get("StreetDirSuffix")]
-    street = " ".join(str(p).strip() for p in parts if p and str(p).strip())
-    # RESO puts the direction before the name; our stored convention is
-    # "905 N Harbor City Blvd", which the join above already produces when
-    # StreetDirPrefix follows StreetNumber — reorder number first.
-    if d.get("StreetDirPrefix") and d.get("StreetNumber"):
-        parts = [d.get("StreetNumber"), d.get("StreetDirPrefix"), d.get("StreetName"),
-                 d.get("StreetSuffix"), d.get("StreetDirSuffix")]
-        street = " ".join(str(p).strip() for p in parts if p and str(p).strip())
+def _street(d: dict, sf: dict | None = None) -> str:
+    # The exporter nulls some flat address parts (StreetDirPrefix/Suffix, and
+    # UnitNumber on condos) that the embedded StandardFieldsJson still has.
+    # Without them "1675 S Fiske Blvd" loses its S and the units of one
+    # building collapse to a single street address — exact-address search
+    # then returns 2 matches instead of 1. Flat value wins when present.
+    emb = sf or {}
+
+    def g(key: str) -> str:
+        v = d.get(key)
+        if v is None or not str(v).strip():
+            v = emb.get(key)
+        if isinstance(v, float) and v.is_integer():
+            v = int(v)  # a JSON 4875.0 house number is "4875"
+        return " ".join(str(v).split()) if v is not None else ""
+
+    name, suffix = g("StreetName"), g("StreetSuffix")
+    # Feed quirk: StreetName sometimes already ends with the suffix word
+    # ("Long Iron Drive" + "Drive", or "San Filippo Drive SE" + "Drive") —
+    # nobody types "Drive Drive".
+    if suffix and suffix.lower() in name.lower().split()[-2:]:
+        suffix = ""
+    # Same guard for directions the name already embeds ("N Harbor City" + "N").
+    pre, post = g("StreetDirPrefix"), g("StreetDirSuffix")
+    if pre and name.lower().split()[:1] == [pre.lower()]:
+        pre = ""
+    if post and name.lower().split()[-1:] == [post.lower()]:
+        post = ""
+    # Stored convention is "905 N Harbor City Blvd": number, then direction.
+    parts = [g("StreetNumber"), pre, name, suffix, post]
+    street = " ".join(p for p in parts if p)
     if not street:
-        street = str(d.get("UnparsedAddress") or "").split(",")[0].strip()
-    unit = d.get("UnitNumber")
-    if unit and str(unit).strip() and str(unit).strip().lower() not in street.lower():
-        street = f"{street} APT {str(unit).strip()}"
+        street = " ".join(g("UnparsedAddress").split(",")[0].split())
+    # Bare unit value: "#2101" / "Unit 2101" / "Apt 2101" -> "2101", so the
+    # stored "APT 2101" matches what the exact-address matcher compares.
+    unit = re.sub(r"^(?:#|\b(?:apt|apartment|unit|ste|suite)\b[\s.#-]*)+", "",
+                  g("UnitNumber"), flags=re.IGNORECASE).strip()
+    # Only the UnparsedAddress fallback can already contain the unit. Whole-token
+    # check past the house number: unit "A" is a substring of "Lane", "2" of
+    # "2100", and "5 Elm St" unit 5 must still get its APT 5.
+    present = [t.lstrip("#") for t in street.lower().split()[1:]]  # "#4" counts as 4
+    if street and unit and unit.lower() not in present:
+        street = f"{street} APT {unit}"
     return street
 
 
@@ -244,7 +277,7 @@ def transform_mls(data: dict, fallback_id: str = "") -> tuple[str, dict]:
         "zpid": data.get("ListingId"),
         "homeStatus": status,
         "address": {
-            "streetAddress": _street(data),
+            "streetAddress": _street(data, sf),
             "city": data.get("City") or "",
             "state": data.get("StateOrProvince") or "",
             "zipcode": str(data.get("PostalCode") or ""),
