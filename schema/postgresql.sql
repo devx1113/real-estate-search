@@ -129,7 +129,7 @@ CREATE TABLE raw_properties (
                      'partial_image_only_processed',
                      'processed',
                      'batch_submitted',
-                     -- Terminal: listing is not FOR_SALE, so it is never analyzed or
+                     -- Terminal: listing is outside the catalog statuses (FOR_SALE/PENDING), so it is never analyzed or
                      -- ingested (raw_db.prune_non_for_sale). A re-upload via /process
                      -- resets it to 'unprocessed', so this is not a permanent blacklist.
                      'skipped_not_for_sale',
@@ -144,7 +144,7 @@ CREATE TABLE raw_properties (
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX idx_raw_properties_status ON raw_properties(status);
--- The catalog is FOR_SALE-only; the prune/claim paths filter on this expression.
+-- The catalog carries FOR_SALE and PENDING listings; the prune/claim paths filter on this expression.
 CREATE INDEX idx_raw_properties_home_status ON raw_properties ((data->>'homeStatus'));
 
 -- Curated feature alternatives per user phrase (feature_resolver). Created lazily

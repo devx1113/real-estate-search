@@ -120,7 +120,7 @@ async def _process_unprocessed(
                     )
                     # The superseded raw row is dead weight: nothing references
                     # its GUID any more, and keeping it would make the
-                    # non-FOR_SALE prune / photo joins see a phantom listing.
+                    # catalog prune / photo joins see a phantom listing.
                     await conn.execute(
                         "DELETE FROM raw_properties WHERE id = $1 AND id <> $2",
                         dup["guid"], item_id,
@@ -559,13 +559,13 @@ async def _worker_iteration(pool: asyncpg.Pool) -> tuple[int, int]:
     """Process one iteration; returns (claimed, succeeded), claimed=0 meaning no work.
     Batch mode is BATCH-EXCLUSIVE: all photo analysis flows through _batch_step, and the
     sync claim below only handles metadata-only rows (image_only_processed)."""
-    # Catalog is FOR_SALE-only: drop listings that sold/went pending since ingest and
-    # park their pending rows BEFORE any vision work is scheduled below.
+    # Catalog rule (FOR_SALE/PENDING): drop listings that sold or otherwise left the
+    # catalog since ingest and park their pending rows BEFORE any vision work below.
     try:
         async with pool.acquire() as conn:
             await prune_non_for_sale(conn)
     except Exception as e:  # noqa: BLE001 — never let the prune stall ingestion
-        logger.warning(f"Worker: FOR_SALE prune failed: {e}")
+        logger.warning(f"Worker: catalog prune failed: {e}")
 
     batch_activity = 0
     if settings.vision_use_batch:

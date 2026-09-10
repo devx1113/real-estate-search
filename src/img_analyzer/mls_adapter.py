@@ -14,11 +14,14 @@ Mapping decisions (documented in the 2026-09 field audit):
   match the frontend DB; a missing/zero-GUID wrapper id falls back to
   SparkId/ListingKey. ListingId -> the zpid slot, so re-uploads of the same
   listing are adopted as updates instead of duplicating.
-- status: StandardStatus -> homeStatus (Active=FOR_SALE; everything else maps to
-  a non-FOR_SALE value and is pruned/parked by the existing catalog rule).
-  Listing CLASS (StandardFieldsJson.PropertyClass) then narrows Active further:
-  rentals -> FOR_RENT, land/commercial -> OTHER, so only residential homes for
-  sale ever enter the catalog (a $1,800 rental or an empty lot is not a home).
+- status: StandardStatus -> homeStatus (Active=FOR_SALE; Active Under Contract /
+  Pending=PENDING — both searchable per the 2026-09-10 catalog rule; everything
+  else maps to a non-catalog value and is pruned/parked). Listing CLASS
+  (StandardFieldsJson.PropertyClass / PropertyType A-F) then narrows further:
+  rentals -> FOR_RENT and commercial -> OTHER never enter the catalog; land
+  enters as home_type LOT (a $1,800 rental is not a home; a lot is for sale).
+- masking: the MLS withholds some fields as "********"; such values are treated
+  as missing (a masked unit / city / county is not a value).
 - address: number, direction, name, suffix, direction, "APT unit" — each part
   taken from the flat record, falling back to StandardFieldsJson when the
   exporter nulls it (directions, condo UnitNumber). Duplicated suffix/direction
@@ -74,6 +77,15 @@ def _ci(d) -> _CI:
     return _CI(d if isinstance(d, dict) else {})
 
 
+def _masked(v) -> bool:
+    """The MLS withholds some fields (unit, city, zoning...) as '********'."""
+    return isinstance(v, str) and re.fullmatch(r"\*{2,}", v.strip()) is not None
+
+
+def _unmasked(v):
+    return None if _masked(v) else v
+
+
 def _merged(flat: _CI, sf: _CI) -> _CI:
     """One read view per field: the exporter's flat value wins when present; a
     null/empty flat value falls back to the embedded StandardFieldsJson (the
@@ -91,11 +103,12 @@ def _merged(flat: _CI, sf: _CI) -> _CI:
     return _CI(out)
 
 
-# StandardFieldsJson.PropertyClass (Spark) -> listing class. Only residential
-# FOR-SALE listings belong in the catalog: rentals carry a MONTHLY price and
-# land/commercial have no rooms — all three would surface as absurd "homes".
+# StandardFieldsJson.PropertyClass (Spark) -> listing class. Residential and
+# land listings belong in the catalog (land as home_type LOT); rentals carry a
+# MONTHLY price and commercial has no rooms — both would surface as absurd "homes".
 _CLASS_BY_LABEL = {
     "residential": "residential",
+    "residential income": "residential",
     "rental": "rental",
     "residential lease": "rental",
     "land": "land",
@@ -137,6 +150,10 @@ _TYPE_MAP = [
     ("multi-family", "MULTI_FAMILY"),
     ("apartment", "CONDO"),
     ("villa", "TOWNHOUSE"),
+    ("unimproved land", "LOT"),
+    ("vacant land", "LOT"),
+    ("acreage", "LOT"),
+    ("land", "LOT"),
 ]
 
 # (uri key, width for the jpeg ladder). UriLarge is the original upload — widest.
@@ -190,8 +207,10 @@ def _street(d: dict, sf: dict | None = None) -> str:
 
     def g(key: str) -> str:
         v = d.get(key)
-        if v is None or not str(v).strip():
+        if v is None or not str(v).strip() or _masked(v):
             v = emb.get(key)
+        if _masked(v):
+            v = None  # a privacy mask is not a value
         if isinstance(v, float) and v.is_integer():
             v = int(v)  # a JSON 4875.0 house number is "4875"
         return " ".join(str(v).split()) if v is not None else ""
@@ -300,17 +319,24 @@ def transform_mls(data: dict, fallback_id: str = "") -> tuple[str, dict]:
     data = _merged(orig, sf)
     status = _STATUS_MAP.get(str(data.get("StandardStatus") or "").strip().lower(), "OTHER")
     listing_class = _listing_class(data, sf)
-    if status == "FOR_SALE" and listing_class == "rental":
+    # Catalog rule (2026-09-10): PropertyType A/B/C (residential, residential
+    # income, land) with Active / Active Under Contract / Pending are searchable;
+    # rentals (F) and commercial (D/E) never are, whatever their status.
+    in_catalog = status in ("FOR_SALE", "PENDING")
+    if in_catalog and listing_class == "rental":
         status = "FOR_RENT"
-    elif status == "FOR_SALE" and listing_class in ("land", "commercial"):
+    elif in_catalog and listing_class == "commercial":
         status = "OTHER"
-    home_type = _home_type(data.get("PropertySubType"), sf.get("PropertyTypeLabel"))
-    if status == "FOR_SALE" and home_type is None:
+    if listing_class == "land":
+        home_type = "LOT"
+    else:
+        home_type = _home_type(data.get("PropertySubType"), sf.get("PropertyTypeLabel"))
+    if status in ("FOR_SALE", "PENDING") and home_type is None:
         logger.warning(
             "MLS %s: unmapped PropertySubType %r (class=%s) -> home_type NULL",
             data.get("ListingId"), data.get("PropertySubType"), listing_class,
         )
-    county = str(data.get("CountyOrParish") or "").strip()
+    county = str(_unmasked(data.get("CountyOrParish")) or "").strip()
     if county and not county.lower().endswith("county"):
         county = f"{county} County"
 
@@ -332,10 +358,10 @@ def transform_mls(data: dict, fallback_id: str = "") -> tuple[str, dict]:
         "homeStatus": status,
         "address": {
             "streetAddress": _street(data, sf),
-            "city": data.get("City") or "",
-            "state": data.get("StateOrProvince") or "",
-            "zipcode": str(data.get("PostalCode") or ""),
-            "subdivision": data.get("SubdivisionName") or "",
+            "city": _unmasked(data.get("City")) or "",
+            "state": _unmasked(data.get("StateOrProvince")) or "",
+            "zipcode": str(_unmasked(data.get("PostalCode")) or ""),
+            "subdivision": _unmasked(data.get("SubdivisionName")) or "",
         },
         "latitude": data.get("Latitude"),
         "longitude": data.get("Longitude"),

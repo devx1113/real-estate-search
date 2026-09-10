@@ -127,13 +127,14 @@ async def claim_pending_batch(
         SELECT id, data, status, updated_at
         FROM raw_properties
         WHERE status = ANY($2)
-          AND data->>'homeStatus' = 'FOR_SALE'  -- active listings only (see prune_non_for_sale)
+          AND data->>'homeStatus' = ANY($3)  -- catalog statuses only (see prune_non_for_sale)
         ORDER BY updated_at ASC
         LIMIT $1
         FOR UPDATE SKIP LOCKED
         """,
         limit,
         statuses,
+        list(CATALOG_STATUSES),
     )
     return rows
 
@@ -161,30 +162,32 @@ async def get_status_counts(conn) -> dict[str, int]:
     return {r["status"]: r["n"] for r in rows}
 
 
-# Client requirement: the catalog carries ACTIVE listings only. Anything Zillow
-# no longer marks FOR_SALE (SOLD, RECENTLY_SOLD, PENDING, PRE_FORECLOSURE,
-# FOR_RENT, OTHER — and any status added upstream later) must not be searchable.
-# Enforced as a keep-only-FOR_SALE rule so a new upstream status can never leak in.
+# Client requirement (2026-09-10, MLS feed): the catalog carries listings that are
+# for sale — MLS StandardStatus Active, Active Under Contract and Pending, i.e.
+# homeStatus FOR_SALE or PENDING. Anything else (SOLD, FOR_RENT, OTHER — and any
+# status added upstream later) must not be searchable. Enforced as a keep-only
+# rule so a new upstream status can never leak in.
+CATALOG_STATUSES = ("FOR_SALE", "PENDING")
 SKIPPED_NOT_FOR_SALE = "skipped_not_for_sale"
 
 _PENDING_STATUSES = ("unprocessed", "partial_image_only_processed", "image_only_processed")
 
 
 async def prune_non_for_sale(conn) -> tuple[int, int]:
-    """Enforce the FOR_SALE-only catalog; returns (properties_deleted, rows_skipped).
+    """Enforce the catalog-status rule (FOR_SALE/PENDING); returns (properties_deleted, rows_skipped).
 
     Three parts, all idempotent and cheap when there is nothing to do:
-      1. DELETE properties whose OWN raw record is no longer FOR_SALE — a listing
-         re-sent under the same GUID after it sold / went pending (children cascade).
+      1. DELETE properties whose OWN raw record has left the catalog statuses — a
+         listing re-sent under the same GUID after it sold / was withdrawn (children cascade).
       2. DELETE properties superseded by a NEWER raw record with the same zpid that is
-         not FOR_SALE. The scraper re-issues GUIDs on re-scrape, so a status change
+         off-catalog. The scraper re-issues GUIDs on re-scrape, so a status change
          usually arrives under a new GUID: it gets parked by part 3 and the old
-         FOR_SALE row would otherwise stay searchable forever (1550 Mars St, 2026-08).
+         catalog row would otherwise stay searchable forever (1550 Mars St, 2026-08).
          "Newer" is decided by upload time, so an OLD pending record can never delete
          a listing that has since been re-listed and adopted under a new GUID.
-      3. Park still-pending raw rows of non-FOR_SALE listings in a terminal status so
+      3. Park still-pending raw rows of off-catalog listings in a terminal status so
          the worker never claims them: no vision spend on homes we would delete anyway.
-    A listing that returns to FOR_SALE is re-uploaded as 'unprocessed' by /process and
+    A listing that returns to a catalog status is re-uploaded as 'unprocessed' by /process and
     flows through normally, so this never permanently blacklists a property.
     """
     deleted = await conn.fetchval(
@@ -193,11 +196,12 @@ async def prune_non_for_sale(conn) -> tuple[int, int]:
             DELETE FROM properties p
             USING raw_properties r
             WHERE r.id = p.guid
-              AND r.data->>'homeStatus' IS DISTINCT FROM 'FOR_SALE'
+              AND coalesce(r.data->>'homeStatus', '') <> ALL($1::text[])
             RETURNING p.id
         )
         SELECT count(*) FROM gone
-        """
+        """,
+        list(CATALOG_STATUSES),
     )
     superseded = await conn.fetchval(
         """
@@ -209,11 +213,12 @@ async def prune_non_for_sale(conn) -> tuple[int, int]:
               AND newer.id <> own.id
               AND newer.data->>'zpid' = p.zpid::text
               AND newer.created_at > own.created_at
-              AND newer.data->>'homeStatus' IS DISTINCT FROM 'FOR_SALE'
+              AND coalesce(newer.data->>'homeStatus', '') <> ALL($1::text[])
             RETURNING p.id
         )
         SELECT count(*) FROM gone
-        """
+        """,
+        list(CATALOG_STATUSES),
     )
     deleted = (deleted or 0) + (superseded or 0)
     skipped = await conn.fetchval(
@@ -222,17 +227,18 @@ async def prune_non_for_sale(conn) -> tuple[int, int]:
             UPDATE raw_properties
             SET status = $1, updated_at = NOW()
             WHERE status = ANY($2)
-              AND data->>'homeStatus' IS DISTINCT FROM 'FOR_SALE'
+              AND coalesce(data->>'homeStatus', '') <> ALL($3::text[])
             RETURNING id
         )
         SELECT count(*) FROM parked
         """,
         SKIPPED_NOT_FOR_SALE,
         list(_PENDING_STATUSES),
+        list(CATALOG_STATUSES),
     )
     if deleted or skipped:
         logger.info(
-            "Catalog prune: %d non-FOR_SALE property(ies) removed, %d pending row(s) skipped",
+            "Catalog prune: %d off-catalog property(ies) removed, %d pending row(s) skipped",
             deleted, skipped,
         )
     return deleted or 0, skipped or 0

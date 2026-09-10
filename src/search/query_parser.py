@@ -195,7 +195,7 @@ gas station, pharmacy / drugstore, restaurant, hospital, bank, park, gym.
 min_year_built (int|null), max_year_built (int|null), \
 min_lot_sqft (int|null), max_lot_sqft (int|null), \
 min_stories (int|null), max_stories (int|null)
-   VALID home_type values: SINGLE_FAMILY, CONDO, TOWNHOUSE, MANUFACTURED, MULTI_FAMILY
+   VALID home_type values: SINGLE_FAMILY, CONDO, TOWNHOUSE, MANUFACTURED, MULTI_FAMILY, LOT
    Only set home_type when the user's term CLEARLY maps to one of these values.
    If ambiguous (e.g. "apartment", "home", "house", "property"), do NOT set home_type.
    Mapping:
@@ -204,6 +204,8 @@ min_stories (int|null), max_stories (int|null)
      "single family" / "single-family home" / "family home" / "family house" / "family residence" / "starter home" → SINGLE_FAMILY
      "manufactured home" / "mobile home" → MANUFACTURED
      "duplex" / "multi family" / "multi-family" / "two-family" → MULTI_FAMILY
+     "land" / "lot" / "lots" / "vacant land" / "vacant lot" / "acreage" / "parcel" / "building lot" → LOT
+   Lots are EXCLUDED from results unless home_type=LOT is set, so any request for land MUST set it.
    IMPORTANT: When the user describes a HOME TYPE phrase (e.g. "family home", "starter home", \
 "single-family residence"), emit it ONLY as a `property` criterion with `home_type` set. \
 Do NOT also emit a `feature` criterion for the same phrase. \

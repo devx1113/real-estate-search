@@ -31,7 +31,7 @@ import asyncpg
 from config.settings import settings
 from src.img_analyzer.analyzer import build_grouped_system_prompt, parse_group_output
 from src.img_analyzer.models import PhotoResult
-from src.img_analyzer.raw_db import extract_photo_urls_from_data, primary_photo_urls
+from src.img_analyzer.raw_db import CATALOG_STATUSES, extract_photo_urls_from_data, primary_photo_urls
 from src.llm_client import get_async_client
 
 logger = logging.getLogger(__name__)
@@ -167,11 +167,12 @@ async def _pending_rows(conn: asyncpg.Connection) -> list[asyncpg.Record]:
         """
         SELECT id, data, status, updated_at FROM raw_properties
         WHERE status IN ('unprocessed', 'partial_image_only_processed', 'batch_submitted')
-          AND data->>'homeStatus' = 'FOR_SALE'  -- active listings only (see prune_non_for_sale)
+          AND data->>'homeStatus' = ANY($2)  -- catalog statuses only (see prune_non_for_sale)
         ORDER BY updated_at ASC
         LIMIT $1
         """,
         settings.vision_batch_max_items,
+        list(CATALOG_STATUSES),
     )
 
 
