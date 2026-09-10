@@ -22,7 +22,7 @@ from src.data.feature_registry import registry
 from src.img_analyzer.router import router as img_analyzer_router
 from src.img_analyzer.test_router import router as vision_test_router
 from src.models.search import CriterionType, ParsedQuery
-from src.search.orchestrator import search
+from src.search.orchestrator import _load_results as load_brief_properties, search
 from src.search.photo_search import detailed_photos
 from src.search.query_parser import QueryParseError
 
@@ -991,6 +991,34 @@ async def health_disk():
         thresholds={"warning_free_pct": DISK_WARN_FREE_PCT, "critical_free_pct": DISK_CRIT_FREE_PCT},
         checked_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
+
+
+@app.get("/properties/{propertyId}", response_model=BriefProperty)
+async def get_brief_property(propertyId: str):
+    """The search-result card for ONE listing, by GUID (the `propertyId` search
+    returns — the same id the frontend database uses). Identical shape to a
+    /search `briefproperties` entry and built by the same code path, so the two
+    never drift. 404 when the id is not in the catalog (unknown, parked as
+    not-for-sale, or removed). GUID matching is case-insensitive."""
+    pool = await get_pool()
+    guid = propertyId.strip()
+    async with pool.acquire() as conn:
+        # Exact match first (uses the unique guid index); case-insensitive fallback
+        # for callers that upper-case GUIDs.
+        internal_id = await conn.fetchval("SELECT id FROM properties WHERE guid = $1", guid)
+        if internal_id is None:
+            internal_id = await conn.fetchval(
+                "SELECT id FROM properties WHERE lower(guid) = lower($1)", guid
+            )
+    if internal_id is None:
+        raise HTTPException(status_code=404, detail=f"Property '{propertyId}' not found")
+    results = await load_brief_properties(pool, [internal_id])
+    if not results:
+        raise HTTPException(status_code=404, detail=f"Property '{propertyId}' not found")
+    brief = results[0]
+    brief.pop("_internal_id", None)
+    brief.setdefault("matchedSoft", [])
+    return brief
 
 
 @app.get("/property/{guid}")
