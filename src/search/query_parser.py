@@ -191,11 +191,11 @@ gas station, pharmacy / drugstore, restaurant, hospital, bank, park, gym.
 "waterfront", "downtown" — use the "feature" type for those ("near beach" → feature="beach").
 
 7. property — Property attribute constraints.
-   Fields: home_type (string|null), min_rent (int|null), max_rent (int|null), \
+   Fields: home_type (string|null), listing_type (string|null), min_rent (int|null), max_rent (int|null), \
 min_year_built (int|null), max_year_built (int|null), \
 min_lot_sqft (int|null), max_lot_sqft (int|null), \
 min_stories (int|null), max_stories (int|null)
-   VALID home_type values: SINGLE_FAMILY, CONDO, TOWNHOUSE, MANUFACTURED, MULTI_FAMILY, LOT
+   VALID home_type values: SINGLE_FAMILY, CONDO, TOWNHOUSE, MANUFACTURED, MULTI_FAMILY, LOT, COMMERCIAL
    Only set home_type when the user's term CLEARLY maps to one of these values.
    If ambiguous (e.g. "apartment", "home", "house", "property"), do NOT set home_type.
    Mapping:
@@ -206,6 +206,13 @@ min_stories (int|null), max_stories (int|null)
      "duplex" / "multi family" / "multi-family" / "two-family" → MULTI_FAMILY
      "land" / "lot" / "lots" / "vacant land" / "vacant lot" / "acreage" / "parcel" / "building lot" → LOT
    Results include land lots by default; set home_type=LOT only when the user asks for land/lots specifically.
+     "office space" / "retail space" / "warehouse" / "industrial space" / "commercial space" / "storefront" → COMMERCIAL
+   listing_type — the catalog half. "rent" when the user wants a RENTAL: "for rent", "rental(s)", \
+"to rent", "lease" / "for lease", "apartment(s) for rent", "renting", or a MONTHLY amount \
+("$2,000/mo", "2k per month", "under $1,800 a month"). "sale" only when they say "for sale" / \
+"to buy" / "purchase". Otherwise null (the search defaults to sale). Rentals are never mixed \
+into sale results, so any rental request MUST set listing_type="rent". A monthly amount is a \
+RENT bound (max_rent / min_rent), NOT a price criterion.
    IMPORTANT: When the user describes a HOME TYPE phrase (e.g. "family home", "starter home", \
 "single-family residence"), emit it ONLY as a `property` criterion with `home_type` set. \
 Do NOT also emit a `feature` criterion for the same phrase. \
@@ -643,6 +650,8 @@ async def _parse_query_uncached(query: str, max_retries: int = 2) -> ParsedQuery
                     ymax = None
                 criteria.append(PropertyCriterion(
                     home_type=c.get("home_type"),
+                    listing_type=(str(c.get("listing_type")).strip().lower()
+                                  if c.get("listing_type") in ("rent", "sale", "Rent", "Sale", "RENT", "SALE") else None),
                     min_rent=c.get("min_rent"),
                     max_rent=c.get("max_rent"),
                     min_year_built=ymin,

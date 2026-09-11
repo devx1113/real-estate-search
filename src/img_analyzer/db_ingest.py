@@ -389,6 +389,43 @@ async def _refresh_has_covered_pool(conn, prop_id: int) -> None:
     )
 
 
+async def ensure_property_columns(conn) -> None:
+    """Self-migrating additions to `properties` (the schema file only runs on a
+    fresh database). home_status mirrors the raw record's homeStatus so search can
+    split sale (FOR_SALE/PENDING) from rent (FOR_RENT) with a plain indexed column.
+    Idempotent; the backfill touches only rows still NULL."""
+    await conn.execute("ALTER TABLE properties ADD COLUMN IF NOT EXISTS home_status TEXT")
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_properties_home_status ON properties(home_status)"
+    )
+    n = await conn.fetchval(
+        """
+        WITH filled AS (
+            UPDATE properties p SET home_status = r.data->>'homeStatus'
+            FROM raw_properties r
+            WHERE r.id = p.guid AND p.home_status IS NULL
+            RETURNING p.id
+        )
+        SELECT count(*) FROM filled
+        """
+    )
+    if n:
+        logger.info("properties.home_status backfilled for %d row(s)", n)
+
+
+async def refresh_home_status(conn, prop_id: int) -> None:
+    """Copy the raw record's homeStatus onto the property row (call after any
+    write that may change it; idempotent)."""
+    await conn.execute(
+        """
+        UPDATE properties p SET home_status = r.data->>'homeStatus'
+        FROM raw_properties r
+        WHERE r.id = p.guid AND p.id = $1
+        """,
+        prop_id,
+    )
+
+
 async def assign_region_ids(conn, prop_id: int) -> None:
     """Assign the four *_region_id columns for ONE property — the per-property
     version of src/data/backfill_region_ids.py, same precedence per level:
@@ -555,6 +592,7 @@ async def update_property_scalars(
     await _refresh_has_covered_pool(conn, existing_id)
     # Re-assign region ids (coordinates or the raw record may have moved).
     await assign_region_ids(conn, existing_id)
+    await refresh_home_status(conn, existing_id)
 
 
 async def update_property_metadata(
@@ -605,6 +643,7 @@ async def update_property_metadata(
     await _refresh_has_covered_pool(conn, existing_id)
     # Re-assign region ids (coordinates or the raw record may have moved).
     await assign_region_ids(conn, existing_id)
+    await refresh_home_status(conn, existing_id)
 
 
 async def update_property_with_children(

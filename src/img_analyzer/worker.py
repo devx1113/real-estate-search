@@ -30,6 +30,7 @@ from src.img_analyzer.db_ingest import (
     refresh_property_room_counts,
     update_property_scalars,
     update_property_with_children,
+    ensure_property_columns, refresh_home_status,
 )
 from src.img_analyzer.models import Photo, PhotoResult, PropertyItem
 from src.img_analyzer.raw_db import (
@@ -423,6 +424,7 @@ async def _insert_primary_full(conn, item: dict) -> None:
     )
     await _insert_children(conn, prop_id, rooms_from_photos, _extract_schools(item))
     await assign_region_ids(conn, prop_id)
+    await refresh_home_status(conn, prop_id)
 
 
 MAX_INGEST_ATTEMPTS = 5
@@ -606,6 +608,8 @@ async def run_worker_forever() -> None:
         try:
             pool = await get_pool()
             if not recovery_done:
+                async with pool.acquire() as conn:
+                    await ensure_property_columns(conn)  # self-migrating schema additions
                 # Flag off but rows left 'batch_submitted' by a previous run → requeue
                 # once, or nothing would ever claim them.
                 if not settings.vision_use_batch:

@@ -42,6 +42,7 @@ async def apply_hard_filters(
     area_region_id: int | None = None,
     area_region_type: str | None = None,
     drawn_polygon: list[tuple[float, float]] | None = None,
+    listing_mode: str | None = "sale",
 ) -> list[int]:
     """Return property IDs passing ALL criteria; bounds is an optional bbox, filters
     are per-field overrides that suppress matching LLM sub-conditions.
@@ -49,6 +50,12 @@ async def apply_hard_filters(
     Every catalog listing is eligible, land lots (home_type LOT) included — the
     catalog is "everything for sale" (2026-09-11 decision); callers narrow by
     type only through an explicit property_types filter or a parsed home_type.
+
+    listing_mode: "sale" (default) restricts to FOR_SALE/PENDING, "rent" to
+    FOR_RENT — the two halves are never mixed because a rental's price is a
+    monthly rent. None = no restriction (exact-address lookups: an address names
+    one listing whichever way it is offered). In rent mode, rent bounds
+    (min_rent/max_rent) apply to the listing price itself.
 
     area_region_id: geo-location mode — the searched place resolved to this regions
     row, so membership replaces the target criterion's PLACE-NAME condition (its
@@ -306,12 +313,13 @@ async def apply_hard_filters(
                 conditions.append(f"UPPER(home_type) = UPPER(${param_idx})")
                 params.append(criterion.home_type)
                 param_idx += 1
+            rent_col = "price_usd" if listing_mode == "rent" else "rent_estimate"
             if criterion.min_rent is not None:
-                conditions.append(f"rent_estimate >= ${param_idx}")
+                conditions.append(f"{rent_col} >= ${param_idx}")
                 params.append(criterion.min_rent)
                 param_idx += 1
             if criterion.max_rent is not None:
-                conditions.append(f"rent_estimate <= ${param_idx}")
+                conditions.append(f"{rent_col} <= ${param_idx}")
                 params.append(criterion.max_rent)
                 param_idx += 1
             if criterion.min_year_built is not None and "year_from" not in covered:
@@ -339,6 +347,13 @@ async def apply_hard_filters(
                 params.append(criterion.max_stories)
                 param_idx += 1
             # has_pool / has_waterfront deliberately skipped: handled as features so positive + negative sum to the total.
+
+    # Sale vs rent: never mix the two halves of the catalog. NULL home_status only
+    # exists before the one-time backfill has run; treat it as sale.
+    if listing_mode == "rent":
+        conditions.append("home_status = 'FOR_RENT'")
+    elif listing_mode == "sale":
+        conditions.append("(home_status IS NULL OR home_status <> 'FOR_RENT')")
 
     where_clause = " AND ".join(conditions) if conditions else "TRUE"
     query = f"SELECT id FROM properties WHERE {where_clause}"

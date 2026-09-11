@@ -68,7 +68,8 @@ class ProximityCriterion(BaseModel):
 
 class PropertyCriterion(BaseModel):
     type: CriterionType = CriterionType.PROPERTY
-    home_type: str | None = None  # SINGLE_FAMILY, CONDO, TOWNHOUSE, MANUFACTURED, MULTI_FAMILY
+    home_type: str | None = None  # SINGLE_FAMILY, CONDO, TOWNHOUSE, MANUFACTURED, MULTI_FAMILY, LOT, COMMERCIAL
+    listing_type: str | None = None  # "rent" when the user asks for rentals, "sale" when explicit, else None
     min_rent: int | None = None
     max_rent: int | None = None
     min_year_built: int | None = None

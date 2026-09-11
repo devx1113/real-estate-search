@@ -17,9 +17,9 @@ Mapping decisions (documented in the 2026-09 field audit):
 - status: StandardStatus -> homeStatus (Active=FOR_SALE; Active Under Contract /
   Pending=PENDING — both searchable per the 2026-09-10 catalog rule; everything
   else maps to a non-catalog value and is pruned/parked). Listing CLASS
-  (StandardFieldsJson.PropertyClass / PropertyType A-F) then narrows further:
-  rentals -> FOR_RENT and commercial -> OTHER never enter the catalog; land
-  enters as home_type LOT (a $1,800 rental is not a home; a lot is for sale).
+  (PropertyType A-F, labels as fallback) then narrows further: E/F leases ->
+  FOR_RENT (searchable as rentals since 2026-09-11, price = monthly rent, E
+  typed COMMERCIAL), D commercial sale -> OTHER (never), land -> home_type LOT.
 - masking: the MLS withholds some fields as "********"; such values are treated
   as missing (a masked unit / city / county is not a value).
 - address: number, direction, name, suffix, direction, "APT unit" — each part
@@ -103,24 +103,24 @@ def _merged(flat: _CI, sf: _CI) -> _CI:
     return _CI(out)
 
 
-# StandardFieldsJson.PropertyClass (Spark) -> listing class. Residential and
-# land listings belong in the catalog (land as home_type LOT); rentals carry a
-# MONTHLY price and commercial has no rooms — both would surface as absurd "homes".
+# Listing class. The exporter's PropertyType letter is authoritative (its enum:
+# A Residential, B Residential Income, C Land, D Commercial Sale, E Commercial
+# Lease, F Residential Lease); StandardFieldsJson labels are the fallback.
+# Catalog (2026-09-11): A/B/C for sale, E/F for rent (FOR_RENT, monthly price;
+# E gets home_type COMMERCIAL), D never.
+_CLASS_BY_CODE = {"A": "residential", "B": "residential", "C": "land",
+                  "D": "commercial", "E": "commercial_lease", "F": "rental"}
 _CLASS_BY_LABEL = {
     "residential": "residential",
     "residential income": "residential",
     "rental": "rental",
     "residential lease": "rental",
     "land": "land",
-    "commercial": "commercial",
-    "commercial lease": "commercial",
+    "commercial lease": "commercial_lease",
     "commercial sale": "commercial",
+    "commercial": "commercial",
     "business opportunity": "commercial",
 }
-# Spark PropertyType letter codes seen in the feed, fallback when the
-# StandardFieldsJson labels are absent.
-_CLASS_BY_CODE = {"A": "residential", "B": "residential", "C": "land",
-                  "D": "commercial", "E": "commercial", "F": "rental"}
 
 _STATUS_MAP = {
     "active": "FOR_SALE",
@@ -182,11 +182,16 @@ def is_mls_record(data: dict) -> bool:
 
 
 def _listing_class(data: dict, sf: dict) -> str | None:
-    for label in (sf.get("PropertyClass"), sf.get("PropertyTypeLabel")):
+    code = _CLASS_BY_CODE.get(str(data.get("PropertyType") or "").strip().upper())
+    if code:
+        return code
+    # PropertyTypeLabel first: PropertyClass says just "Commercial" for both
+    # sale (D) and lease (E); the label tells them apart.
+    for label in (sf.get("PropertyTypeLabel"), sf.get("PropertyClass")):
         cls = _CLASS_BY_LABEL.get(str(label or "").strip().lower())
         if cls:
             return cls
-    return _CLASS_BY_CODE.get(str(data.get("PropertyType") or "").strip().upper())
+    return None
 
 
 def _home_type(sub_type: str | None, type_label: str | None) -> str | None:
@@ -319,19 +324,23 @@ def transform_mls(data: dict, fallback_id: str = "") -> tuple[str, dict]:
     data = _merged(orig, sf)
     status = _STATUS_MAP.get(str(data.get("StandardStatus") or "").strip().lower(), "OTHER")
     listing_class = _listing_class(data, sf)
-    # Catalog rule (2026-09-10): PropertyType A/B/C (residential, residential
-    # income, land) with Active / Active Under Contract / Pending are searchable;
-    # rentals (F) and commercial (D/E) never are, whatever their status.
+    # Catalog rule (2026-09-10/11): PropertyType A/B/C (residential, residential
+    # income, land) with Active / Active Under Contract / Pending are for sale
+    # (FOR_SALE / PENDING); E/F (commercial / residential lease) are for rent
+    # (FOR_RENT — price is the MONTHLY rent; search keeps the two apart);
+    # D (commercial sale) never enters, whatever its status.
     in_catalog = status in ("FOR_SALE", "PENDING")
-    if in_catalog and listing_class == "rental":
+    if in_catalog and listing_class in ("rental", "commercial_lease"):
         status = "FOR_RENT"
     elif in_catalog and listing_class == "commercial":
         status = "OTHER"
     if listing_class == "land":
         home_type = "LOT"
+    elif listing_class == "commercial_lease":
+        home_type = "COMMERCIAL"
     else:
         home_type = _home_type(data.get("PropertySubType"), sf.get("PropertyTypeLabel"))
-    if status in ("FOR_SALE", "PENDING") and home_type is None:
+    if status in ("FOR_SALE", "PENDING", "FOR_RENT") and home_type is None:
         logger.warning(
             "MLS %s: unmapped PropertySubType %r (class=%s) -> home_type NULL",
             data.get("ListingId"), data.get("PropertySubType"), listing_class,

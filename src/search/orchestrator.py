@@ -554,6 +554,22 @@ async def _load_results(pool: asyncpg.Pool, property_ids: list[int]) -> list[dic
     return results
 
 
+def _listing_mode(criteria: list, filters: dict | None, address) -> str | None:
+    """Which half of the catalog a search runs against. An explicit request
+    filter wins; else a parsed rent intent ("for rent", "$2k/mo") selects rent;
+    else sale. An exact address is exempt (None): it names one listing whichever
+    way it is offered."""
+    if address is not None:
+        return None
+    requested = (filters or {}).get("listing_type")
+    if requested in ("sale", "rent"):
+        return requested
+    for c in criteria:
+        if isinstance(c, PropertyCriterion) and c.listing_type in ("sale", "rent"):
+            return c.listing_type
+    return "sale"
+
+
 def _criterion_labels(criterion) -> list[str]:
     """Human-readable labels for each SQL condition a criterion produces."""
     labels: list[str] = []
@@ -615,6 +631,7 @@ async def _collect_hard_filter_steps(
     area_region_id: int | None = None,
     area_region_type: str | None = None,
     drawn_polygon: list[tuple[float, float]] | None = None,
+    listing_mode: str | None = "sale",
 ) -> list[dict]:
     """Debug-only: apply bounds/filters/criteria one at a time, recording count per
     step. area_region_id (+area_region_type in region-ID mode) mirrors the real
@@ -630,8 +647,14 @@ async def _collect_hard_filter_steps(
     partial_filters: dict = {}
     prev = int(total)
 
+    if listing_mode in ("sale", "rent"):
+        count = len(await apply_hard_filters(pool, applied, listing_mode=listing_mode))
+        steps.append({"step": f"listing mode: {listing_mode}", "count": count, "dropped": prev - count})
+        prev = count
+
     if drawn_polygon:
-        count = len(await apply_hard_filters(pool, applied, drawn_polygon=drawn_polygon))
+        count = len(await apply_hard_filters(pool, applied, drawn_polygon=drawn_polygon,
+                                             listing_mode=listing_mode))
         steps.append({
             "step": f"drawn polygon ({len(drawn_polygon)} points)",
             "count": count,
@@ -641,7 +664,7 @@ async def _collect_hard_filter_steps(
 
     if bounds:
         count = len(await apply_hard_filters(pool, applied, bounds=bounds,
-                                             drawn_polygon=drawn_polygon))
+                                             drawn_polygon=drawn_polygon, listing_mode=listing_mode))
         steps.append({
             "step": "bounds",
             "count": count,
@@ -657,7 +680,7 @@ async def _collect_hard_filter_steps(
             partial_filters[key] = value
             count = len(await apply_hard_filters(
                 pool, applied, bounds=bounds, filters=partial_filters,
-                drawn_polygon=drawn_polygon,
+                drawn_polygon=drawn_polygon, listing_mode=listing_mode,
             ))
             steps.append({
                 "step": f"filter: {label_tpl.format(v=value)}",
@@ -676,7 +699,7 @@ async def _collect_hard_filter_steps(
         count = len(await apply_hard_filters(
             pool, applied, bounds=bounds, filters=filters,
             area_region_id=area_region_id, area_region_type=area_region_type,
-            drawn_polygon=drawn_polygon,
+            drawn_polygon=drawn_polygon, listing_mode=listing_mode,
         ))
         steps.append({
             "step": ", ".join(labels),
@@ -858,6 +881,8 @@ async def search(
         )
 
     # Phase 2: Hard filters (incl. bounds + filters)
+    listing_mode = _listing_mode(parsed_query.criteria, filters, address)
+    logger.info(f"Phase 2: listing mode = {listing_mode or 'any (address)'}")
     logger.info(
         f"Phase 2: Hard filters (PostgreSQL)"
         f"{' + map bounds' if bounds else ''}"
@@ -868,13 +893,13 @@ async def search(
             await _collect_hard_filter_steps(
                 pool, parsed_query.criteria, bounds, filters,
                 area_region_id=area_region_id, area_region_type=area_region_type,
-                drawn_polygon=drawn_polygon,
+                drawn_polygon=drawn_polygon, listing_mode=listing_mode,
             )
         )
     property_ids = await apply_hard_filters(
         pool, parsed_query.criteria, bounds=bounds, filters=filters,
         area_region_id=area_region_id, area_region_type=area_region_type,
-        drawn_polygon=drawn_polygon,
+        drawn_polygon=drawn_polygon, listing_mode=listing_mode,
     )
     if debug and area_region_id:
         filter_steps.append({
@@ -1214,4 +1239,6 @@ async def search(
         "address_mode": address is not None,
         # Complete address AND exactly one home survived every criterion.
         "exact_address": address is not None and total_count == 1,
+        # "sale" | "rent" | None (exact address: whichever way it is offered).
+        "listing_mode": listing_mode,
     }

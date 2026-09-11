@@ -162,12 +162,14 @@ async def get_status_counts(conn) -> dict[str, int]:
     return {r["status"]: r["n"] for r in rows}
 
 
-# Client requirement (2026-09-10, MLS feed): the catalog carries listings that are
-# for sale — MLS StandardStatus Active, Active Under Contract and Pending, i.e.
-# homeStatus FOR_SALE or PENDING. Anything else (SOLD, FOR_RENT, OTHER — and any
-# status added upstream later) must not be searchable. Enforced as a keep-only
-# rule so a new upstream status can never leak in.
-CATALOG_STATUSES = ("FOR_SALE", "PENDING")
+# Client requirement (2026-09-10/11, MLS feed): the catalog carries listings that
+# are for sale — StandardStatus Active / Active Under Contract / Pending on
+# PropertyType A/B/C (homeStatus FOR_SALE or PENDING) — and, since 2026-09-11,
+# rentals: PropertyType E (commercial lease) and F (residential lease), homeStatus
+# FOR_RENT. Anything else (SOLD, OTHER, commercial SALE — and any status added
+# upstream later) must not be searchable. Enforced as a keep-only rule so a new
+# upstream status can never leak in. Search separates sale from rent (listing_mode).
+CATALOG_STATUSES = ("FOR_SALE", "PENDING", "FOR_RENT")
 SKIPPED_NOT_FOR_SALE = "skipped_not_for_sale"
 
 _PENDING_STATUSES = ("unprocessed", "partial_image_only_processed", "image_only_processed")

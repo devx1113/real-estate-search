@@ -48,7 +48,8 @@ CREATE TABLE properties (
     garage_count    INTEGER NOT NULL DEFAULT 0,
 
     -- Property attributes (from Zillow structured data)
-    home_type       TEXT,                -- SINGLE_FAMILY, CONDO, TOWNHOUSE, MANUFACTURED, MULTI_FAMILY
+    home_type       TEXT,                -- SINGLE_FAMILY, CONDO, TOWNHOUSE, MANUFACTURED, MULTI_FAMILY, LOT, COMMERCIAL
+    home_status     TEXT,                -- FOR_SALE | PENDING | FOR_RENT (mirrors raw homeStatus; search splits sale/rent on it)
     rent_estimate   INTEGER,             -- monthly rent (rentZestimate)
     year_built      INTEGER,
     lot_size_sqft   INTEGER DEFAULT 0,
@@ -239,6 +240,7 @@ CREATE INDEX idx_properties_district ON properties(district);
 
 -- Property attribute filters
 CREATE INDEX idx_properties_home_type ON properties(home_type);
+CREATE INDEX idx_properties_home_status ON properties(home_status);
 CREATE INDEX idx_properties_rent ON properties(rent_estimate);
 CREATE INDEX idx_properties_year_built ON properties(year_built);
 CREATE INDEX idx_properties_lot_size ON properties(lot_size_sqft);

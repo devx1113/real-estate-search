@@ -22,6 +22,7 @@ from src.data.feature_registry import registry
 from src.img_analyzer.router import router as img_analyzer_router
 from src.img_analyzer.test_router import router as vision_test_router
 from src.models.search import CriterionType, ParsedQuery
+from src.img_analyzer.db_ingest import ensure_property_columns
 from src.search.orchestrator import _load_results as load_brief_properties, search
 from src.search.photo_search import detailed_photos
 from src.search.query_parser import QueryParseError
@@ -37,6 +38,8 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     pool = await get_pool()
     logger.info("Database pool initialized")
+    async with pool.acquire() as conn:
+        await ensure_property_columns(conn)  # self-migrating schema additions
 
     # Fail loudly+early on a missing key rather than a cryptic 401 on the first LLM call.
     if not settings.openai_api_key:
@@ -303,7 +306,8 @@ class Bounds(BaseModel):
     west: float
 
 
-ALLOWED_HOME_TYPES = {"SINGLE_FAMILY", "CONDO", "TOWNHOUSE", "MANUFACTURED", "MULTI_FAMILY", "LOT"}
+ALLOWED_HOME_TYPES = {"SINGLE_FAMILY", "CONDO", "TOWNHOUSE", "MANUFACTURED", "MULTI_FAMILY", "LOT", "COMMERCIAL"}
+ALLOWED_LISTING_TYPES = {"sale", "rent"}
 
 
 class Filters(BaseModel):
@@ -317,6 +321,19 @@ class Filters(BaseModel):
     sqft_max: int | None = None
     year_from: int | None = None
     year_to: int | None = None
+    # "sale" (default when omitted) or "rent": which catalog half to search. Sale
+    # searches never include rentals (their price is a MONTHLY rent).
+    listing_type: str | None = None
+
+    @field_validator("listing_type")
+    @classmethod
+    def _norm_listing_type(cls, v):
+        if v is None or str(v).strip() == "":
+            return None
+        low = str(v).strip().lower()
+        if low not in ALLOWED_LISTING_TYPES:
+            raise ValueError(f"Invalid listing_type '{v}'. Allowed: {sorted(ALLOWED_LISTING_TYPES)}")
+        return low
 
     @field_validator("property_types")
     @classmethod
@@ -536,6 +553,9 @@ class SearchFilters(BaseModel):
     sqft_max: int = 0
     year_from: int = 0
     year_to: int = 0
+    # "sale" | "rent": the half of the catalog this search ran against ("" only
+    # for exact-address lookups, which match a listing whichever way it is offered).
+    listing_type: str = ""
 
 
 def _extract_filters(parsed) -> SearchFilters:
@@ -913,7 +933,9 @@ async def search_properties(request: SearchRequest):
             regionId=result.get("region_id"),
             polygons=result.get("polygons"),
             detectedLocation=result.get("location_detected", False),
-            filters=_extract_filters(result["parsed_query"]),
+            filters=_extract_filters(result["parsed_query"]).model_copy(
+                update={"listing_type": result.get("listing_mode") or ""}
+            ),
             relaxed=result.get("relaxed", []),
             softCriteria=result.get("soft_criteria", []),
             exactAddress=result.get("exact_address", False),
