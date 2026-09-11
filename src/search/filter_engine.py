@@ -42,14 +42,13 @@ async def apply_hard_filters(
     area_region_id: int | None = None,
     area_region_type: str | None = None,
     drawn_polygon: list[tuple[float, float]] | None = None,
-    homes_only: bool = True,
 ) -> list[int]:
     """Return property IDs passing ALL criteria; bounds is an optional bbox, filters
     are per-field overrides that suppress matching LLM sub-conditions.
 
-    homes_only: when no home type is requested, exclude land (home_type LOT) so a
-    generic "homes in X" search is not padded with lots. Callers pass False when
-    the query is an exact street address — an address names one listing, lot or not.
+    Every catalog listing is eligible, land lots (home_type LOT) included — the
+    catalog is "everything for sale" (2026-09-11 decision); callers narrow by
+    type only through an explicit property_types filter or a parsed home_type.
 
     area_region_id: geo-location mode — the searched place resolved to this regions
     row, so membership replaces the target criterion's PLACE-NAME condition (its
@@ -340,14 +339,6 @@ async def apply_hard_filters(
                 params.append(criterion.max_stories)
                 param_idx += 1
             # has_pool / has_waterfront deliberately skipped: handled as features so positive + negative sum to the total.
-
-    # Homes by default: land (home_type LOT) only appears when a type filter or the
-    # parsed query asked for a type — "homes in palm bay" must not fill up with lots.
-    type_requested = bool((filters or {}).get("property_types")) or any(
-        isinstance(c, PropertyCriterion) and c.home_type for c in hard_criteria
-    )
-    if homes_only and not type_requested:
-        conditions.append("(home_type IS NULL OR UPPER(home_type) <> 'LOT')")
 
     where_clause = " AND ".join(conditions) if conditions else "TRUE"
     query = f"SELECT id FROM properties WHERE {where_clause}"

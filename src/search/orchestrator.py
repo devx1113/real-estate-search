@@ -615,7 +615,6 @@ async def _collect_hard_filter_steps(
     area_region_id: int | None = None,
     area_region_type: str | None = None,
     drawn_polygon: list[tuple[float, float]] | None = None,
-    homes_only: bool = True,
 ) -> list[dict]:
     """Debug-only: apply bounds/filters/criteria one at a time, recording count per
     step. area_region_id (+area_region_type in region-ID mode) mirrors the real
@@ -632,8 +631,7 @@ async def _collect_hard_filter_steps(
     prev = int(total)
 
     if drawn_polygon:
-        count = len(await apply_hard_filters(pool, applied, drawn_polygon=drawn_polygon,
-                                             homes_only=homes_only))
+        count = len(await apply_hard_filters(pool, applied, drawn_polygon=drawn_polygon))
         steps.append({
             "step": f"drawn polygon ({len(drawn_polygon)} points)",
             "count": count,
@@ -643,7 +641,7 @@ async def _collect_hard_filter_steps(
 
     if bounds:
         count = len(await apply_hard_filters(pool, applied, bounds=bounds,
-                                             drawn_polygon=drawn_polygon, homes_only=homes_only))
+                                             drawn_polygon=drawn_polygon))
         steps.append({
             "step": "bounds",
             "count": count,
@@ -659,7 +657,7 @@ async def _collect_hard_filter_steps(
             partial_filters[key] = value
             count = len(await apply_hard_filters(
                 pool, applied, bounds=bounds, filters=partial_filters,
-                drawn_polygon=drawn_polygon, homes_only=homes_only,
+                drawn_polygon=drawn_polygon,
             ))
             steps.append({
                 "step": f"filter: {label_tpl.format(v=value)}",
@@ -678,7 +676,7 @@ async def _collect_hard_filter_steps(
         count = len(await apply_hard_filters(
             pool, applied, bounds=bounds, filters=filters,
             area_region_id=area_region_id, area_region_type=area_region_type,
-            drawn_polygon=drawn_polygon, homes_only=homes_only,
+            drawn_polygon=drawn_polygon,
         ))
         steps.append({
             "step": ", ".join(labels),
@@ -870,14 +868,13 @@ async def search(
             await _collect_hard_filter_steps(
                 pool, parsed_query.criteria, bounds, filters,
                 area_region_id=area_region_id, area_region_type=area_region_type,
-                drawn_polygon=drawn_polygon, homes_only=address is None,
+                drawn_polygon=drawn_polygon,
             )
         )
     property_ids = await apply_hard_filters(
         pool, parsed_query.criteria, bounds=bounds, filters=filters,
         area_region_id=area_region_id, area_region_type=area_region_type,
         drawn_polygon=drawn_polygon,
-        homes_only=address is None,  # an exact address may name a lot
     )
     if debug and area_region_id:
         filter_steps.append({

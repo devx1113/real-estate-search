@@ -205,7 +205,7 @@ min_stories (int|null), max_stories (int|null)
      "manufactured home" / "mobile home" → MANUFACTURED
      "duplex" / "multi family" / "multi-family" / "two-family" → MULTI_FAMILY
      "land" / "lot" / "lots" / "vacant land" / "vacant lot" / "acreage" / "parcel" / "building lot" → LOT
-   Lots are EXCLUDED from results unless home_type=LOT is set, so any request for land MUST set it.
+   Results include land lots by default; set home_type=LOT only when the user asks for land/lots specifically.
    IMPORTANT: When the user describes a HOME TYPE phrase (e.g. "family home", "starter home", \
 "single-family residence"), emit it ONLY as a `property` criterion with `home_type` set. \
 Do NOT also emit a `feature` criterion for the same phrase. \
