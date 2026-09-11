@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     # (the token saving). Groups failing match-validation retry at 5 images, then 1.
     vision_group_max_images: int = 20
 
+    # Photo size served in search-result cards (briefproperties / GET /properties):
+    # the SMALLEST rendition at least this wide (MLS ladder 300/640/800/1024/1280/
+    # 1600/2048/original; Zillow 384..1536). 640 = the frontend's card size
+    # (Mostafa, 2026-09-11); the detail endpoint (/search/photos) always serves
+    # the full-size original.
+    search_card_photo_min_width: int = 640
+
     # Region-ID search: True -> the searched place filters by the properties'
     # stored *_region_id columns (assigned at ingest; backfill:
     # python -m src.data.backfill_region_ids). False -> legacy polygon

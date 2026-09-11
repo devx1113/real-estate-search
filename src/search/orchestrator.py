@@ -396,8 +396,9 @@ def _photo_groups(
     requirement); listings with no Exterior photo fall back to the listing's own
     lead photo as cover. Within the Pool group, photos in `water_urls` (canonical
     urls whose tags show actual pool water) sort ahead of equipment-only shots.
-    urls are the SMALLEST-width jpegs (search results are cards/thumbnails;
-    full-size urls live on the property detail endpoint)."""
+    urls are the smallest rendition at least settings.search_card_photo_min_width
+    wide (cards must stay sharp — the MLS feed's smallest size is only 300 px);
+    full-size urls live on the property detail endpoint (full_size=True)."""
     if not photos_json:
         return []
     try:
@@ -415,8 +416,13 @@ def _photo_groups(
         candidates = [s for s in jpegs if isinstance(s, dict) and s.get("url")]
         if not candidates:
             continue
-        smallest = min(candidates, key=lambda s: s.get("width") or 10**9)
         canonical = max(candidates, key=lambda s: s.get("width") or 0)["url"]
+        # Card rendition: the smallest size that is still >= the configured width;
+        # a listing with only smaller renditions serves its largest.
+        min_w = settings.search_card_photo_min_width
+        big_enough = [s for s in candidates if (s.get("width") or 0) >= min_w]
+        card = (min(big_enough, key=lambda s: s.get("width") or 10**9) if big_enough
+                else max(candidates, key=lambda s: s.get("width") or 0))
         room_type = room_type_by_url.get(canonical)
         if not room_type or room_type in ("Unknown", "Main"):
             # "Unknown" = vision couldn't classify. "Main" is reserved for the
@@ -425,7 +431,7 @@ def _photo_groups(
             room_type = "Other"
         # full_size (detail/lightbox endpoint) serves the canonical highest-width
         # url; search results serve the smallest (cards/thumbnails).
-        serve_url = canonical if full_size else smallest["url"]
+        serve_url = canonical if full_size else card["url"]
         if first_serve_url is None:
             first_serve_url = serve_url
         groups.setdefault(room_type, []).append((serve_url, canonical))

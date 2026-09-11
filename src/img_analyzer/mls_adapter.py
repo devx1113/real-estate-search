@@ -157,10 +157,13 @@ _TYPE_MAP = [
 ]
 
 # (uri key, width for the jpeg ladder). UriLarge is the original upload — widest.
+# Uri640 is the search-card rendition (frontend requirement, 2026-09-11).
 _PHOTO_URIS = [
     ("Uri300", 300),
+    ("Uri640", 640),
     ("Uri800", 800),
     ("Uri1024", 1024),
+    ("Uri1280", 1280),
     ("Uri1600", 1600),
     ("Uri2048", 2048),
     ("UriLarge", 2560),
@@ -261,13 +264,15 @@ def _photos(d: dict, sf: dict | None = None) -> list[dict]:
                                p.get("DisplayOrder") is None, p.get("DisplayOrder") or 0))
     out = []
     for p in photos:
-        seen: set[str] = set()
-        jpeg = []
+        # One entry per distinct URL. Spark repeats the ORIGINAL's URL under every
+        # size key when no resized renditions exist, so a repeated URL keeps the
+        # LARGEST width it was offered under (it is the original, not an 800px).
+        by_url: dict[str, int] = {}
         for key, width in _PHOTO_URIS:
             url = p.get(key)
-            if url and url not in seen:
-                seen.add(url)
-                jpeg.append({"url": url, "width": width})
+            if url:
+                by_url[url] = max(width, by_url.get(url, 0))
+        jpeg = [{"url": u, "width": w} for u, w in sorted(by_url.items(), key=lambda kv: kv[1])]
         if jpeg:
             out.append({"caption": p.get("Caption") or "", "mixedSources": {"jpeg": jpeg}})
     return out
