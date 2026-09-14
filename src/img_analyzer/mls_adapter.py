@@ -278,6 +278,33 @@ def _photos(d: dict, sf: dict | None = None) -> list[dict]:
     return out
 
 
+def _open_houses(d: dict, sf: dict) -> list[dict]:
+    """OpenHouses[] -> [{"start": ISO-UTC, "end": ISO-UTC}], the shape the API's
+    openHouse label reads. Spark's OpenHouseStart/EndTimestamp are UTC; when they
+    are missing, Date + StartTime/EndTime are the listing's local clock times. The
+    exporter's flat array can arrive empty while StandardFieldsJson has the list."""
+    from src.search.open_house import listing_timezone
+    local_tz = listing_timezone(_unmasked(d.get("CountyOrParish")))
+    raw = d.get("OpenHouses") or sf.get("OpenHouses") or []
+    out: list[dict] = []
+    for e in raw if isinstance(raw, list) else []:
+        if not isinstance(e, dict):
+            continue
+        e = _ci(e)
+        start, end = e.get("OpenHouseStartTimestamp"), e.get("OpenHouseEndTimestamp")
+        if not (start and end):
+            try:
+                day = str(e.get("Date") or "").strip()
+                start = datetime.strptime(f"{day} {e.get('StartTime')}".upper(), "%m/%d/%Y %I:%M %p") \
+                    .replace(tzinfo=local_tz).isoformat()
+                end = datetime.strptime(f"{day} {e.get('EndTime')}".upper(), "%m/%d/%Y %I:%M %p") \
+                    .replace(tzinfo=local_tz).isoformat()
+            except (ValueError, TypeError):
+                continue
+        out.append({"start": str(start), "end": str(end)})
+    return out
+
+
 def _days_on_market(d: dict, home_status: str) -> int | None:
     for key in ("DaysOnMarket", "CumulativeDaysOnMarket"):
         v = d.get(key)
@@ -408,6 +435,9 @@ def transform_mls(data: dict, fallback_id: str = "") -> tuple[str, dict]:
             "high": data.get("HighSchool"),
         },
         "originalPhotos": _photos(data, sf),
+        # UTC intervals; the API turns the first one that has not ended into the
+        # openHouse label at request time.
+        "openHouses": _open_houses(data, sf),
         # Everything the mapping does not consume, preserved for future features.
         "mls": {k: v for k, v in orig.items() if str(k).lower() not in _MLS_KEEP_SKIP},
     }

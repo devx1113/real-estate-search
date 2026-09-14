@@ -2,11 +2,13 @@
 
 import asyncio
 import json
+from datetime import datetime, timezone
 import logging
 
 import asyncpg
 
 from config.settings import settings
+from src.search.open_house import listing_timezone, open_house_label
 from src.data.feature_registry import registry
 from src.data.geolocate import locate_by_point
 from src.data.us_states import state_variants
@@ -460,6 +462,16 @@ def _photo_groups(
     ]
 
 
+def _json_list(value) -> list:
+    """jsonb column value (asyncpg returns text) -> list; anything else -> []."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return []
+    return value if isinstance(value, list) else []
+
+
 def _blank_to_none(value: str | None) -> str | None:
     return value.strip() if value and value.strip() else None
 
@@ -502,6 +514,7 @@ async def _load_results(pool: asyncpg.Pool, property_ids: list[int]) -> list[dic
                    r.data->>'currency'     AS currency,
                    r.data->>'homeStatus'   AS home_status,
                    r.data->>'daysOnZillow' AS days_on_market,
+                   r.data->'openHouses'    AS open_houses,
                    r.data->>'originalPhotos' AS photos_json
             FROM properties p
             LEFT JOIN raw_properties r ON r.id = p.guid
@@ -517,6 +530,7 @@ async def _load_results(pool: asyncpg.Pool, property_ids: list[int]) -> list[dic
         if rr["pool_water"]:
             water_urls.setdefault(rr["property_id"], set()).add(rr["photo_url"])
 
+    now = datetime.now(timezone.utc)  # one clock for the whole page's open-house labels
     results = []
     for r in rows:
         lat, lon = r["lat"], r["lon"]
@@ -556,6 +570,8 @@ async def _load_results(pool: asyncpg.Pool, property_ids: list[int]) -> list[dic
             ),
             # Frozen at scrape time — does NOT tick daily after ingest.
             "daysOnmarket": days,
+            "openHouse": open_house_label(_json_list(r["open_houses"]), now,
+                                          listing_timezone(r["county"])),
             "yearBuilt": r["year_built"],
             "county": _blank_to_none(r["county"]),
             "lotAreaValue": float(r["lot_size_sqft"]) if r["lot_size_sqft"] else None,
