@@ -398,6 +398,14 @@ async def ensure_property_columns(conn) -> None:
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_properties_home_status ON properties(home_status)"
     )
+    # Location-first regions (2026-09-14): every city polygon covering the pin, and
+    # whether the pin is trustworthy. NULL until assign_region_ids / the backfill
+    # runs — search falls back to city_region_id for such rows.
+    await conn.execute("ALTER TABLE properties ADD COLUMN IF NOT EXISTS city_region_ids BIGINT[]")
+    await conn.execute("ALTER TABLE properties ADD COLUMN IF NOT EXISTS location_trusted BOOLEAN")
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_properties_city_region_ids ON properties USING GIN (city_region_ids)"
+    )
     n = await conn.fetchval(
         """
         WITH filled AS (
@@ -426,90 +434,141 @@ async def refresh_home_status(conn, prop_id: int) -> None:
     )
 
 
+# Location-first region assignment (2026-09-14). The MLS "City" is the USPS
+# mailing city, which spills far past legal city limits (USPS "Melbourne" covers
+# Viera, Suntree and West Melbourne), so filing by name put homes outside the
+# boundary the map draws. The pin now decides, with these safety rules:
+#   - a pin is TRUSTED only when present (not 0,0) and within PIN_TRUST_TOLERANCE_M
+#     of the listing's own county (any county of its state when the county is
+#     unknown) — MLS pins are sometimes hundreds of km off (a Melbourne house in
+#     Pensacola), while real border parcels sit a few km across a county line.
+#     Untrusted pins fall back to the address names and are hidden on the map
+#     (location_trusted = false). The county name matches in the stated state
+#     first, then any state (agents mistype the state: "Cape Canaveral, NC");
+#     the mailing city is looked up in the resolved county's state;
+#   - county: covering polygon, else the nearest county within
+#     COUNTY_SNAP_TOLERANCE_M — the coarse coastline cuts off beachfront homes by
+#     up to ~1 km — else the county name;
+#   - city: EVERY covering city polygon goes into city_region_ids, so a home inside
+#     overlapping areas (Viera over Rockledge / Melbourne) counts for both
+#     searches; city_region_id keeps one primary (the mailing city when it is
+#     among them). A pin covered by no city polygon keeps its mailing city only
+#     within CITY_EDGE_TOLERANCE_M of that city's boundary, else no city;
+#   - zipcode / neighborhood: covering polygon (ZIP falls back to the postal text).
+PIN_TRUST_TOLERANCE_M = 5000.0
+COUNTY_SNAP_TOLERANCE_M = 2000.0
+CITY_EDGE_TOLERANCE_M = 250.0
+
+
 async def assign_region_ids(conn, prop_id: int) -> None:
-    """Assign the four *_region_id columns for ONE property — the per-property
-    version of src/data/backfill_region_ids.py, same precedence per level:
-    Zillow's RAW region id -> smallest covering polygon -> (ZIP only)
-    postal_code text match -> NULL. Raw ids are stored UNGUARDED (no regions-row
-    existence check): the raw feed may arrive before the regions table is
-    prepared, and a stored id becomes searchable the moment its region row
-    lands — no reassignment needed. Exception: parentRegion is ambiguous (a ZIP
-    for most records, a neighborhood for unincorporated communities), so the
-    neighborhood column takes the explicit neighborhoodId field unguarded, and
-    parentRegion only when it is a known type-1 region. Idempotent; call after
-    any write that may move the point or change the raw record."""
+    """Assign county / city / zipcode / neighborhood region ids for ONE property
+    from its map location (rules above), plus city_region_ids, location_trusted
+    and the derived neighborhood name. Idempotent; call after any write that may
+    move the point or change the raw record. Bulk re-run:
+    python -m src.data.backfill_region_ids"""
     await conn.execute(
         """
+        WITH base AS (
+            SELECT p.id, p.geom, p.postal_code, r.data AS raw, p.neighborhood AS cur_nbhd,
+                   (p.geom IS NULL OR (ST_X(p.geom::geometry) = 0 AND ST_Y(p.geom::geometry) = 0)) AS nocoord,
+                   upper(trim(coalesce(r.data->'address'->>'state', p.state, ''))) AS st,
+                   lower(trim(coalesce(r.data->'address'->>'city', p.city, ''))) AS mcity,
+                   lower(trim(coalesce(r.data->>'county', p.county, ''))) AS mcounty
+            FROM properties p LEFT JOIN raw_properties r ON r.id = p.guid
+            WHERE p.id = $1
+        ),
+        county_named AS (
+            SELECT b.*,
+                (SELECT g.regionid FROM regions g
+                  WHERE g.regiontype = '3' AND b.mcounty <> '' AND lower(g.regionname) = b.mcounty
+                  ORDER BY coalesce(g.statecode = b.st, false) DESC, g.regionid LIMIT 1) AS county_by_name
+            FROM base b
+        ),
+        named AS (
+            SELECT c.*, s.eff_state,
+                (SELECT g.regionid FROM regions g
+                  WHERE g.regiontype = '0' AND c.mcity <> '' AND lower(g.regionname) = c.mcity
+                    AND (s.eff_state IS NULL OR g.statecode = s.eff_state)
+                  ORDER BY g.regionid LIMIT 1) AS city_by_name
+            FROM county_named c,
+                 LATERAL (SELECT coalesce((SELECT g.statecode FROM regions g WHERE g.regionid = c.county_by_name),
+                                          nullif(c.st, '')) AS eff_state) s
+        ),
+        trusted AS (
+            SELECT n.*,
+                (NOT n.nocoord AND CASE
+                    WHEN EXISTS (SELECT 1 FROM regions g WHERE g.regionid = n.county_by_name AND g.geom IS NOT NULL)
+                    THEN EXISTS (SELECT 1 FROM regions g WHERE g.regionid = n.county_by_name
+                                   AND ST_DWithin(g.geom, n.geom, $2))
+                    ELSE EXISTS (SELECT 1 FROM regions g WHERE g.regiontype = '3' AND g.geom IS NOT NULL
+                                   AND (n.eff_state IS NULL OR g.statecode = n.eff_state)
+                                   AND ST_DWithin(g.geom, n.geom, $2))
+                END) AS ok
+            FROM named n
+        ),
+        geo AS (
+            SELECT t.*,
+                CASE WHEN t.ok THEN coalesce(
+                    (SELECT g.regionid FROM regions g WHERE g.regiontype = '3' AND g.geom IS NOT NULL
+                       AND ST_Covers(g.geom, t.geom) ORDER BY ST_Area(g.geom), g.regionid LIMIT 1),
+                    (SELECT g.regionid FROM regions g WHERE g.regiontype = '3' AND g.geom IS NOT NULL
+                       AND ST_DWithin(g.geom, t.geom, $4) ORDER BY ST_Distance(g.geom, t.geom), g.regionid LIMIT 1)
+                ) END AS county_geo,
+                CASE WHEN t.ok THEN ARRAY(
+                    SELECT g.regionid FROM regions g WHERE g.regiontype = '0' AND g.geom IS NOT NULL
+                      AND ST_Covers(g.geom, t.geom) ORDER BY ST_Area(g.geom), g.regionid
+                ) ELSE ARRAY[]::bigint[] END AS cities_geo,
+                EXISTS (SELECT 1 FROM regions g WHERE g.regionid = t.city_by_name AND g.geom IS NOT NULL) AS mailing_has_geom,
+                (t.ok AND EXISTS (SELECT 1 FROM regions g WHERE g.regionid = t.city_by_name AND g.geom IS NOT NULL
+                                    AND ST_DWithin(g.geom, t.geom, $3))) AS mailing_near,
+                CASE WHEN t.ok THEN (SELECT g.regionid FROM regions g WHERE g.regiontype = '2' AND g.geom IS NOT NULL
+                       AND ST_Covers(g.geom, t.geom) ORDER BY ST_Area(g.geom), g.regionid LIMIT 1) END AS zip_geo,
+                CASE WHEN t.ok THEN (SELECT g.regionid FROM regions g WHERE g.regiontype = '1' AND g.geom IS NOT NULL
+                       AND ST_Covers(g.geom, t.geom) ORDER BY ST_Area(g.geom), g.regionid LIMIT 1) END AS nbhd_geo,
+                (SELECT g.regionid FROM regions g WHERE g.regiontype = '2' AND g.regionname = t.postal_code
+                  ORDER BY g.regionid LIMIT 1) AS zip_by_text,
+                CASE WHEN (t.raw->>'cityId') ~ '^[0-9]+$' THEN (t.raw->>'cityId')::bigint END AS raw_city,
+                CASE WHEN (t.raw->>'countyId') ~ '^[0-9]+$' THEN (t.raw->>'countyId')::bigint END AS raw_county,
+                CASE WHEN (t.raw->>'zipcodeId') ~ '^[0-9]+$' THEN (t.raw->>'zipcodeId')::bigint END AS raw_zip,
+                CASE WHEN (t.raw->>'neighborhoodId') ~ '^[0-9]+$' THEN (t.raw->>'neighborhoodId')::bigint END AS raw_nbhd,
+                (t.raw ? 'neighborhoodSearchUrl' AND jsonb_typeof(t.raw->'neighborhoodSearchUrl') = 'object') AS feed_has_nbhd
+            FROM trusted t
+        ),
+        ids AS (
+            SELECT g.*,
+                CASE WHEN g.ok THEN
+                    g.cities_geo
+                    || CASE WHEN cardinality(g.cities_geo) = 0 AND g.mailing_near
+                            THEN ARRAY[g.city_by_name] ELSE ARRAY[]::bigint[] END
+                    -- a mailing city without any polygon cannot contradict the pin
+                    || CASE WHEN g.city_by_name IS NOT NULL AND NOT g.mailing_has_geom
+                             AND NOT (g.city_by_name = ANY(g.cities_geo))
+                            THEN ARRAY[g.city_by_name] ELSE ARRAY[]::bigint[] END
+                ELSE
+                    CASE WHEN coalesce(g.raw_city, g.city_by_name) IS NOT NULL
+                         THEN ARRAY[coalesce(g.raw_city, g.city_by_name)] ELSE ARRAY[]::bigint[] END
+                END AS city_ids
+            FROM geo g
+        )
         UPDATE properties p SET
-          city_region_id = COALESCE(
-            (SELECT (r.data->>'cityId')::bigint FROM raw_properties r
-             WHERE r.id = p.guid AND (r.data->>'cityId') ~ '^[0-9]+$'),
-            -- Feed without cityId: the MAILING CITY name decides, exactly as
-            -- Zillow would assign it — BEFORE polygons, so nested community
-            -- polygons (Viera inside Rockledge/Melbourne) cannot split the
-            -- city identity between raw-tier and polygon-tier records.
-            (SELECT g2.regionid FROM regions g2, raw_properties r2
-             WHERE r2.id = p.guid AND g2.regiontype = '0'
-               AND lower(g2.regionname) = lower(trim(r2.data->'address'->>'city'))
-               AND g2.statecode = upper(trim(r2.data->'address'->>'state'))
-             ORDER BY g2.regionid LIMIT 1),
-            (SELECT g.regionid FROM regions g
-             WHERE g.regiontype = '0' AND g.geom IS NOT NULL AND ST_Covers(g.geom, p.geom)
-             ORDER BY ST_Area(g.geom), g.regionid LIMIT 1)
-          ),
-          county_region_id = COALESCE(
-            (SELECT (r.data->>'countyId')::bigint FROM raw_properties r
-             WHERE r.id = p.guid AND (r.data->>'countyId') ~ '^[0-9]+$'),
-            -- Feed without countyId (MLS): the stated county NAME decides
-            -- before polygons — coastline-hugging county boundaries leave
-            -- beachfront points metres outside ST_Covers.
-            (SELECT g2.regionid FROM regions g2, raw_properties r2
-             WHERE r2.id = p.guid AND g2.regiontype = '3'
-               AND lower(g2.regionname) = lower(trim(r2.data->>'county'))
-               AND g2.statecode = upper(trim(r2.data->'address'->>'state'))
-             ORDER BY g2.regionid LIMIT 1),
-            (SELECT g.regionid FROM regions g
-             WHERE g.regiontype = '3' AND g.geom IS NOT NULL AND ST_Covers(g.geom, p.geom)
-             ORDER BY ST_Area(g.geom), g.regionid LIMIT 1)
-          ),
-          zipcode_region_id = COALESCE(
-            (SELECT (r.data->>'zipcodeId')::bigint FROM raw_properties r
-             WHERE r.id = p.guid AND (r.data->>'zipcodeId') ~ '^[0-9]+$'),
-            (SELECT g.regionid FROM regions g
-             WHERE g.regiontype = '2' AND g.geom IS NOT NULL AND ST_Covers(g.geom, p.geom)
-             ORDER BY ST_Area(g.geom), g.regionid LIMIT 1),
-            (SELECT g.regionid FROM regions g
-             WHERE g.regiontype = '2' AND g.regionname = p.postal_code
-             ORDER BY g.regionid LIMIT 1)
-          ),
-          neighborhood_region_id = COALESCE(
-            (SELECT (r.data->>'neighborhoodId')::bigint FROM raw_properties r
-             WHERE r.id = p.guid AND (r.data->>'neighborhoodId') ~ '^[0-9]+$'),
-            (SELECT (r.data->'parentRegion'->>'regionId')::bigint FROM raw_properties r
-             WHERE r.id = p.guid AND (r.data->'parentRegion'->>'regionId') ~ '^[0-9]+$'
-               AND EXISTS (SELECT 1 FROM regions g2
-                           WHERE g2.regionid = (r.data->'parentRegion'->>'regionId')::bigint
-                             AND g2.regiontype = '1')),
-            (SELECT g.regionid FROM regions g
-             WHERE g.regiontype = '1' AND g.geom IS NOT NULL AND ST_Covers(g.geom, p.geom)
-             ORDER BY ST_Area(g.geom), g.regionid LIMIT 1)
-          )
-        WHERE p.id = $1
+            location_trusted = i.ok,
+            city_region_ids = i.city_ids,
+            city_region_id = CASE WHEN i.city_by_name = ANY(i.city_ids) THEN i.city_by_name
+                                  ELSE i.city_ids[1] END,
+            county_region_id = CASE WHEN i.ok THEN coalesce(i.county_geo, i.county_by_name)
+                                    ELSE coalesce(i.raw_county, i.county_by_name) END,
+            zipcode_region_id = CASE WHEN i.ok THEN coalesce(i.zip_geo, i.zip_by_text)
+                                     ELSE coalesce(i.raw_zip, i.zip_by_text) END,
+            neighborhood_region_id = CASE WHEN i.ok THEN i.nbhd_geo ELSE i.raw_nbhd END,
+            -- MLS records carry no neighborhood name: it follows the assigned region.
+            -- A feed-provided name (legacy Zillow records) is never overwritten.
+            neighborhood = CASE WHEN i.feed_has_nbhd AND coalesce(i.cur_nbhd, '') <> '' THEN i.cur_nbhd
+                                ELSE (SELECT g.regionname FROM regions g
+                                       WHERE g.regionid = CASE WHEN i.ok THEN i.nbhd_geo ELSE i.raw_nbhd END) END
+        FROM ids i
+        WHERE p.id = i.id
         """,
-        prop_id,
-    )
-    # The MLS feed has no neighborhood name; once the polygon tier assigned a
-    # neighborhood region, surface its NAME in the text column (used by
-    # name-matching search and the response address block). Never overwrites a
-    # feed-provided name.
-    await conn.execute(
-        """
-        UPDATE properties p SET neighborhood = g.regionname
-        FROM regions g
-        WHERE p.id = $1 AND COALESCE(p.neighborhood, '') = ''
-          AND g.regionid = p.neighborhood_region_id AND g.regiontype = '1'
-        """,
-        prop_id,
+        prop_id, PIN_TRUST_TOLERANCE_M, CITY_EDGE_TOLERANCE_M, COUNTY_SNAP_TOLERANCE_M,
     )
 
 

@@ -392,6 +392,7 @@ async def _known_regions_block() -> str:
                 SELECT g.regiontype, g.regionname FROM regions g
                 WHERE g.regionid IN (
                     SELECT city_region_id FROM properties WHERE city_region_id IS NOT NULL
+                    UNION SELECT unnest(city_region_ids) FROM properties WHERE city_region_ids IS NOT NULL
                     UNION SELECT county_region_id FROM properties WHERE county_region_id IS NOT NULL
                     UNION SELECT neighborhood_region_id FROM properties WHERE neighborhood_region_id IS NOT NULL
                 ) AND g.regiontype IN ('0', '1', '3')

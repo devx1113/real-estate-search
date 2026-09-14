@@ -73,7 +73,9 @@ CREATE TABLE properties (
     -- truth), else polygon containment (smallest-wins), else postal_code text
     -- match (ZIP level only). NULL = unassigned; search falls back to name
     -- matching. Backfill: python -m src.data.backfill_region_ids
-    city_region_id         BIGINT,      -- regiontype '0'
+    city_region_id         BIGINT,      -- regiontype '0' (primary city)
+    city_region_ids        BIGINT[],    -- every city polygon covering the pin (overlaps count for each)
+    location_trusted       BOOLEAN,     -- pin present and within 5 km of its own county; false = hidden on map
     county_region_id       BIGINT,      -- regiontype '3'
     zipcode_region_id      BIGINT,      -- regiontype '2'
     neighborhood_region_id BIGINT,      -- regiontype '1'
@@ -226,6 +228,7 @@ CREATE UNIQUE INDEX idx_properties_zpid ON properties(zpid) WHERE zpid IS NOT NU
 
 -- Region-ID search: one partial index per level (NULL = unassigned, never queried).
 CREATE INDEX idx_properties_city_region ON properties(city_region_id) WHERE city_region_id IS NOT NULL;
+CREATE INDEX idx_properties_city_region_ids ON properties USING GIN (city_region_ids);
 CREATE INDEX idx_properties_county_region ON properties(county_region_id) WHERE county_region_id IS NOT NULL;
 CREATE INDEX idx_properties_zipcode_region ON properties(zipcode_region_id) WHERE zipcode_region_id IS NOT NULL;
 CREATE INDEX idx_properties_neighborhood_region ON properties(neighborhood_region_id) WHERE neighborhood_region_id IS NOT NULL;

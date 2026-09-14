@@ -6,7 +6,7 @@ import re
 import asyncpg
 
 from src.data.us_states import country_variants, state_variants
-from src.search.region_resolver import REGION_ID_COLUMNS, region_property_ids, search_area_target
+from src.search.region_resolver import region_membership_sql, region_property_ids, search_area_target
 from src.models.search import (
     AreaCriterion,
     Criterion,
@@ -86,8 +86,7 @@ async def apply_hard_filters(
         if area_region_type is not None:
             # Region-ID mode: membership precomputed at ingest — one indexed
             # integer equality, no geometry and no cache.
-            col = REGION_ID_COLUMNS[area_region_type]
-            conditions.append(f"{col} = ${param_idx}")
+            conditions.append(region_membership_sql(area_region_type, f"${param_idx}"))
             params.append(area_region_id)
         else:
             # Polygon mode: membership via the cached precomputed id set —
@@ -108,6 +107,7 @@ async def apply_hard_filters(
         conditions.append(
             f"ST_Covers(ST_MakeValid(ST_SetSRID(ST_GeomFromText(${param_idx}), 4326))::geography, geom)"
         )
+        conditions.append("location_trusted IS NOT FALSE")  # a wrong pin is no location
         params.append(wkt)
         param_idx += 1
 
@@ -124,6 +124,7 @@ async def apply_hard_filters(
                 f"ST_Covers(ST_MakeEnvelope(${param_idx}, ${param_idx + 1}, "
                 f"${param_idx + 2}, ${param_idx + 3}, 4326)::geography, geom)"
             )
+            conditions.append("location_trusted IS NOT FALSE")  # a wrong pin is no location
             params.extend([west, south, east, north])
             param_idx += 4
 

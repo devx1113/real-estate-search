@@ -55,16 +55,28 @@ _REGION_IDS_TTL_SEC = 300
 _REGION_IDS_MAX = 64
 
 
-async def _region_id_count(pool: asyncpg.Pool, region_type: str, region_id: int) -> int:
-    """How many properties carry region_id in the column for region_type; 0 when
-    the type has no column. Indexed count — cheap enough to skip caching."""
+def region_membership_sql(region_type: str, placeholder: str) -> str | None:
+    """SQL condition: the property belongs to the region `placeholder` of this
+    type; None when the type has no column. Cities use city_region_ids — a home
+    inside overlapping city polygons (Viera over Rockledge / Melbourne) belongs to
+    each. Rows not yet re-assigned (city_region_ids NULL) fall back to the primary."""
     col = REGION_ID_COLUMNS.get(region_type)
     if col is None:
+        return None
+    if region_type == "0":
+        return (f"(city_region_ids @> ARRAY[{placeholder}::bigint] "
+                f"OR (city_region_ids IS NULL AND city_region_id = {placeholder}))")
+    return f"{col} = {placeholder}"
+
+
+async def _region_id_count(pool: asyncpg.Pool, region_type: str, region_id: int) -> int:
+    """How many properties belong to region_id at this level; 0 when the type
+    has no column. Indexed count — cheap enough to skip caching."""
+    cond = region_membership_sql(region_type, "$1")
+    if cond is None:
         return 0
     async with pool.acquire() as conn:
-        return await conn.fetchval(
-            f"SELECT count(*) FROM properties WHERE {col} = $1", region_id
-        )
+        return await conn.fetchval(f"SELECT count(*) FROM properties WHERE {cond}", region_id)
 
 
 async def _candidate_population(

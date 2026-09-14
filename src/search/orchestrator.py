@@ -190,10 +190,10 @@ async def _filter_by_beachside(
             f"""
             SELECT id FROM properties p
             WHERE id = ANY($1) AND {neg}(
-                p.city_region_id IN (
+                coalesce(p.city_region_ids, ARRAY[p.city_region_id]) && ARRAY(
                     SELECT regionid FROM regions
                     WHERE lower(regionname) = ANY($2::text[]) AND statecode = 'FL'
-                )
+                )::bigint[]
                 OR lower(p.city) = ANY($2::text[])
             )
             """,
@@ -342,26 +342,29 @@ async def _match_color_rooms(
 
 async def _load_pins(pool: asyncpg.Pool, property_ids: list[int]) -> list[dict]:
     """Lightweight map pins for ALL matched properties (the card list is paginated,
-    the map is not): id + coords + price only. 0,0-placeholder coords -> null."""
+    the map is not): id + coords + price only. 0,0-placeholder coords and pins the
+    region assignment flagged untrusted (far outside their own county) -> null."""
     if not property_ids:
         return []
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT guid, ST_Y(geom::geometry) AS lat, ST_X(geom::geometry) AS lon, price_usd
+            SELECT guid, ST_Y(geom::geometry) AS lat, ST_X(geom::geometry) AS lon, price_usd,
+                   location_trusted
             FROM properties WHERE id = ANY($1) ORDER BY id
             """,
             property_ids,
         )
-    return [
-        {
+    out = []
+    for r in rows:
+        placeable = not (r["lat"] == 0 and r["lon"] == 0) and r["location_trusted"] is not False
+        out.append({
             "propertyId": r["guid"],
-            "latitude": r["lat"] if not (r["lat"] == 0 and r["lon"] == 0) else None,
-            "longitude": r["lon"] if not (r["lat"] == 0 and r["lon"] == 0) else None,
+            "latitude": r["lat"] if placeable else None,
+            "longitude": r["lon"] if placeable else None,
             "price": r["price_usd"],
-        }
-        for r in rows
-    ]
+        })
+    return out
 
 
 # Fixed presentation order for photo groups — every property's strip reads the
@@ -495,7 +498,7 @@ async def _load_results(pool: asyncpg.Pool, property_ids: list[int]) -> list[dic
                    p.price_usd, p.bedroom_count, p.bathroom_count, p.area_sqft,
                    p.street, p.city, p.state, p.postal_code,
                    p.neighborhood, p.locality, p.district,
-                   p.home_type, p.year_built, p.county, p.lot_size_sqft,
+                   p.home_type, p.year_built, p.county, p.lot_size_sqft, p.location_trusted,
                    r.data->>'currency'     AS currency,
                    r.data->>'homeStatus'   AS home_status,
                    r.data->>'daysOnZillow' AS days_on_market,
@@ -517,7 +520,7 @@ async def _load_results(pool: asyncpg.Pool, property_ids: list[int]) -> list[dic
     results = []
     for r in rows:
         lat, lon = r["lat"], r["lon"]
-        placeable = not (lat == 0 and lon == 0)
+        placeable = not (lat == 0 and lon == 0) and r["location_trusted"] is not False
         try:
             days = int(r["days_on_market"]) if r["days_on_market"] else None
         except ValueError:
