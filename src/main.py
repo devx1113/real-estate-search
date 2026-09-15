@@ -1019,6 +1019,68 @@ async def health_disk():
     )
 
 
+class BriefPropertyBatchRequest(BaseModel):
+    propertyIds: list[str]  # property GUIDs (the ids /search returns as propertyId)
+
+    @field_validator("propertyIds")
+    @classmethod
+    def _ids_valid(cls, v: list[str]) -> list[str]:
+        ids = [str(x).strip() for x in v if str(x).strip()]
+        if not ids:
+            raise ValueError("propertyIds must contain at least one GUID")
+        if len(ids) > 500:
+            raise ValueError("propertyIds is limited to 500 GUIDs per request")
+        return ids
+
+
+class BriefPropertyBatchResponse(BaseModel):
+    # Found listings, in the order their ids were sent (duplicates returned once).
+    properties: list[BriefProperty]
+    # Requested ids not in the catalog (unknown, parked as not-for-sale, or
+    # removed), as sent, in request order.
+    notFound: list[str] = []
+
+
+@app.post("/properties", response_model=BriefPropertyBatchResponse)
+async def get_brief_properties(request: BriefPropertyBatchRequest):
+    """Batch form of GET /properties/{propertyId}: the search-result card for each
+    listed GUID, built by the same code path as /search. Order follows the request;
+    a GUID sent twice (in any letter case) is returned once; ids not in the catalog
+    are listed in notFound instead of failing the request."""
+    pool = await get_pool()
+    wanted: list[str] = []          # first occurrence of each id, as sent
+    seen: set[str] = set()
+    for raw_id in request.propertyIds:
+        key = raw_id.lower()
+        if key not in seen:
+            seen.add(key)
+            wanted.append(raw_id)
+    async with pool.acquire() as conn:
+        # Exact match first (unique guid index); case-insensitive fallback only
+        # for ids that did not match as sent.
+        rows = await conn.fetch(
+            "SELECT id, guid FROM properties WHERE guid = ANY($1::text[])", wanted
+        )
+        by_key = {r["guid"].lower(): r["id"] for r in rows}
+        missing = [w.lower() for w in wanted if w.lower() not in by_key]
+        if missing:
+            rows = await conn.fetch(
+                "SELECT id, guid FROM properties WHERE lower(guid) = ANY($1::text[])", missing
+            )
+            by_key.update({r["guid"].lower(): r["id"] for r in rows})
+    briefs = await load_brief_properties(pool, list(by_key.values())) if by_key else []
+    by_internal = {b.pop("_internal_id"): b for b in briefs}
+    properties, not_found = [], []
+    for raw_id in wanted:
+        brief = by_internal.get(by_key.get(raw_id.lower()))
+        if brief is None:
+            not_found.append(raw_id)
+            continue
+        brief.setdefault("matchedSoft", [])
+        properties.append(brief)
+    return {"properties": properties, "notFound": not_found}
+
+
 @app.get("/properties/{propertyId}", response_model=BriefProperty)
 async def get_brief_property(propertyId: str):
     """The search-result card for ONE listing, by GUID (the `propertyId` search
