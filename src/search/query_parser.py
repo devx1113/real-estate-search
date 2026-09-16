@@ -1,13 +1,18 @@
 """Query parser: the OpenAI model maps NL queries to structured criteria using the DB's known features/room types."""
 
 import json
+from datetime import datetime
 import re
 import logging
 
 from config.settings import settings
 from src.data.feature_registry import registry
 from src.llm_client import get_query_client
+from src.search.open_house import (
+    LISTING_TZ, local_date_context, normalize_date, normalize_days, normalize_time,
+)
 from src.models.search import (
+    OpenHouseCriterion,
     AreaCriterion,
     AreaRelationCriterion,
     ColorRoomCriterion,
@@ -304,6 +309,35 @@ Use the `feature` criterion type for them — never emit them as property attrib
                                           area_relation(relation="between", place_a="Rockledge", place_b="Viera")
    A plain "homes in Viera" is location #5, NOT area_relation.
 
+10. open_house — The user wants homes with an OPEN HOUSE (a scheduled public
+   showing). Emit it for ANY mention of an open house / open houses / "open for
+   viewing" / "showings this weekend". NEVER emit "open house" as a feature.
+   ("open floor plan", "open kitchen", "open concept" are FEATURES, not this.)
+   Fields: date_from ("YYYY-MM-DD"|null), date_to ("YYYY-MM-DD"|null),
+           time_from ("HH:MM" 24h|null), time_to ("HH:MM" 24h|null),
+           days_of_week (list of "mon","tue","wed","thu","fri","sat","sun"),
+           happening_now (bool), livestream (bool|null), host (string|null)
+   Dates: use ONLY the resolved dates in the CURRENT LOCAL DATE/TIME message.
+     no time words ("open house in Melbourne", "homes with open houses") -> all null/false
+     "today" -> date_from=date_to=today; "tomorrow" -> tomorrow
+     "this weekend" / "next weekend" / "this week" / "next week" / "this month" -> that resolved range
+     "Saturday" / "on Sunday" / "this Saturday" -> that single date from the next-7-days list
+     "next Saturday" -> the Saturday AFTER the one in the next-7-days list (+7 days)
+     "Saturdays" / "any Saturday" / "weekends" -> days_of_week (["sat"] / ["sat","sun"]), no dates
+     "Sep 20" / "9/20" -> that date (this year; next year if already past); "between Sep 20 and 25" -> both dates
+   Times of day (local): "morning" -> time_from 06:00, time_to 12:00; "afternoon" ->
+     12:00-17:00; "evening" -> 17:00-23:59; "tonight" -> today + 17:00-23:59;
+     "after 5 pm" -> time_from 17:00; "before noon" -> time_to 12:00; "at 2 pm" -> time_from 14:00, time_to 14:01
+   "right now" / "happening now" / "open now" / "currently open" / "can visit now" -> happening_now=true
+   "virtual" / "livestream" / "online" open house -> livestream=true; "in person" -> livestream=false
+   "hosted by <name>" / "<name>'s open house" -> host="<name>"
+   Combine with every other criterion as usual. Examples:
+     "open house in melbourne"              -> open_house() PLUS location(city="Melbourne")
+     "3 bed pool homes with an open house this weekend under 500k"
+        -> room_count(Bedroom,min 3) + feature(pool) + price(max 500000) + open_house(date_from/date_to = this weekend)
+     "Saturday morning open houses in Viera" -> open_house(date_from=date_to=<Saturday>, time_from="06:00", time_to="12:00") + location(city="Viera")
+     "which open houses are happening now"   -> open_house(happening_now=true)
+
 Return JSON with this exact structure:
 {{
   "criteria": [ ... list of criterion objects, each with a "type" field ... ],
@@ -465,7 +499,7 @@ def _build_system_prompt(use_embedding_retrieval: bool, known_regions_block: str
     )
 
 
-async def _call_llm(client, system_prompt: str, query: str) -> str | None:
+async def _call_llm(client, system_prompt: str, query: str, context: str = "") -> str | None:
     """Call the query LLM (OpenAI) and return raw JSON text or None (response_format forces strict JSON; fence-stripping is a fallback)."""
     response = await client.chat.completions.create(
         model=settings.openai_model_for_query,
@@ -473,6 +507,8 @@ async def _call_llm(client, system_prompt: str, query: str) -> str | None:
         response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system_prompt},
+            # Per-request facts AFTER the big static prompt so its prefix stays cacheable.
+            *([{"role": "system", "content": context}] if context else []),
             {"role": "user", "content": query},
         ],
     )
@@ -504,7 +540,8 @@ _PARSE_CACHE_MAX = 500
 
 async def parse_query(query: str, max_retries: int = 2) -> ParsedQuery:
     import time
-    key = query.strip().lower()
+    # Local date in the key: "open houses today" must not reuse yesterday's dates.
+    key = f"{datetime.now(LISTING_TZ):%Y-%m-%d}|{query.strip().lower()}"
     hit = _PARSE_CACHE.get(key)
     if hit and time.monotonic() - hit[0] < _PARSE_CACHE_TTL_SEC:
         logger.info("Parse cache hit — skipping LLM call")
@@ -529,7 +566,7 @@ async def _parse_query_uncached(query: str, max_retries: int = 2) -> ParsedQuery
 
     for attempt in range(max_retries):
         try:
-            raw_text = await _call_llm(client, system_prompt, query)
+            raw_text = await _call_llm(client, system_prompt, query, local_date_context())
             if not raw_text:
                 logger.warning(f"LLM returned empty response (attempt {attempt + 1}/{max_retries})")
                 continue
@@ -661,6 +698,18 @@ async def _parse_query_uncached(query: str, max_retries: int = 2) -> ParsedQuery
                     max_lot_sqft=c.get("max_lot_sqft"),
                     min_stories=c.get("min_stories"),
                     max_stories=c.get("max_stories"),
+                ))
+            elif criterion_type == "open_house":
+                livestream = c.get("livestream")
+                criteria.append(OpenHouseCriterion(
+                    date_from=normalize_date(c.get("date_from")) if c.get("date_from") else None,
+                    date_to=normalize_date(c.get("date_to")) if c.get("date_to") else None,
+                    time_from=normalize_time(c.get("time_from")),
+                    time_to=normalize_time(c.get("time_to")),
+                    days_of_week=normalize_days(c.get("days_of_week")),
+                    happening_now=c.get("happening_now") is True,
+                    livestream=livestream if isinstance(livestream, bool) else None,
+                    host=(str(c.get("host")).strip() or None) if c.get("host") else None,
                 ))
             elif criterion_type == "color_room":
                 criteria.append(ColorRoomCriterion(

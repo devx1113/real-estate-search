@@ -229,6 +229,18 @@ CREATE UNIQUE INDEX idx_properties_zpid ON properties(zpid) WHERE zpid IS NOT NU
 -- Region-ID search: one partial index per level (NULL = unassigned, never queried).
 CREATE INDEX idx_properties_city_region ON properties(city_region_id) WHERE city_region_id IS NOT NULL;
 CREATE INDEX idx_properties_city_region_ids ON properties USING GIN (city_region_ids);
+
+-- Open houses: one row per event, synced from the raw record at ingest.
+CREATE TABLE property_open_houses (
+    id          BIGSERIAL PRIMARY KEY,
+    property_id INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
+    starts_at   TIMESTAMPTZ NOT NULL,
+    ends_at     TIMESTAMPTZ NOT NULL,
+    host        TEXT,
+    livestream  BOOLEAN NOT NULL DEFAULT FALSE
+);
+CREATE INDEX idx_open_houses_property ON property_open_houses(property_id);
+CREATE INDEX idx_open_houses_ends ON property_open_houses(ends_at);
 CREATE INDEX idx_properties_county_region ON properties(county_region_id) WHERE county_region_id IS NOT NULL;
 CREATE INDEX idx_properties_zipcode_region ON properties(zipcode_region_id) WHERE zipcode_region_id IS NOT NULL;
 CREATE INDEX idx_properties_neighborhood_region ON properties(neighborhood_region_id) WHERE neighborhood_region_id IS NOT NULL;

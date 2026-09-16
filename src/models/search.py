@@ -13,6 +13,7 @@ class CriterionType(str, Enum):
     PROPERTY = "property"
     COLOR_ROOM = "color_room"
     AREA_RELATION = "area_relation"
+    OPEN_HOUSE = "open_house"
 
 
 class RoomCountCriterion(BaseModel):
@@ -97,6 +98,20 @@ class AreaRelationCriterion(BaseModel):
     radius_miles: float | None = None   # optional override of the default buffer
 
 
+class OpenHouseCriterion(BaseModel):
+    """Listing has a not-yet-ended open house matching these local-time constraints.
+    All fields empty = any upcoming open house."""
+    type: CriterionType = CriterionType.OPEN_HOUSE
+    date_from: str | None = None          # "YYYY-MM-DD", listing-local date
+    date_to: str | None = None            # "YYYY-MM-DD", inclusive
+    time_from: str | None = None          # "HH:MM" 24h: still running after this
+    time_to: str | None = None            # "HH:MM" 24h: starts before this
+    days_of_week: list[str] = []          # "mon".."sun"
+    happening_now: bool = False
+    livestream: bool | None = None        # True = virtual only, False = in person only
+    host: str | None = None               # hosting agent name (substring)
+
+
 Criterion = (
     RoomCountCriterion
     | FeatureCriterion
@@ -107,6 +122,7 @@ Criterion = (
     | PropertyCriterion
     | ColorRoomCriterion
     | AreaRelationCriterion
+    | OpenHouseCriterion
 )
 
 

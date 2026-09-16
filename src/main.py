@@ -310,6 +310,51 @@ ALLOWED_HOME_TYPES = {"SINGLE_FAMILY", "CONDO", "TOWNHOUSE", "MANUFACTURED", "MU
 ALLOWED_LISTING_TYPES = {"sale", "rent"}
 
 
+class OpenHouseFilter(BaseModel):
+    """Open-house window; every field optional (empty object = any upcoming)."""
+    date_from: str | None = None      # "YYYY-MM-DD", listing-local
+    date_to: str | None = None        # "YYYY-MM-DD", inclusive
+    time_from: str | None = None      # "HH:MM" 24h
+    time_to: str | None = None        # "HH:MM" 24h
+    days_of_week: list[str] | None = None   # "mon".."sun"
+    happening_now: bool | None = None
+    livestream: bool | None = None
+    host: str | None = None
+
+    @field_validator("date_from", "date_to")
+    @classmethod
+    def _date(cls, v):
+        if v is None:
+            return None
+        from src.search.open_house import normalize_date
+        norm = normalize_date(v)
+        if norm is None:
+            raise ValueError("dates must be YYYY-MM-DD")
+        return norm
+
+    @field_validator("time_from", "time_to")
+    @classmethod
+    def _time(cls, v):
+        if v is None:
+            return None
+        from src.search.open_house import normalize_time
+        norm = normalize_time(v)
+        if norm is None:
+            raise ValueError("times must be HH:MM (24h)")
+        return norm
+
+    @field_validator("days_of_week")
+    @classmethod
+    def _days(cls, v):
+        if v is None:
+            return None
+        from src.search.open_house import normalize_days
+        days = normalize_days(v)
+        if len(days) != len({str(x).strip().lower()[:3] for x in v}):
+            raise ValueError("days_of_week values must be mon, tue, wed, thu, fri, sat or sun")
+        return days
+
+
 class Filters(BaseModel):
     price_min: int | None = None
     price_max: int | None = None
@@ -324,6 +369,10 @@ class Filters(BaseModel):
     # "sale" (default when omitted) or "rent": which catalog half to search. Sale
     # searches never include rentals (their price is a MONTHLY rent).
     listing_type: str | None = None
+    # Only listings with a not-yet-ended open house: true, or an OpenHouseFilter
+    # window ({"date_from": "2026-09-19", "date_to": "2026-09-20"}). Results are
+    # then ordered by the soonest matching open house.
+    open_house: bool | OpenHouseFilter | None = None
 
     @field_validator("listing_type")
     @classmethod
@@ -560,6 +609,8 @@ class SearchFilters(BaseModel):
     # "sale" | "rent": the half of the catalog this search ran against ("" only
     # for exact-address lookups, which match a listing whichever way it is offered).
     listing_type: str = ""
+    # true when the search was restricted to listings with an open house.
+    open_house: bool = False
 
 
 def _extract_filters(parsed) -> SearchFilters:
@@ -581,6 +632,8 @@ def _extract_filters(parsed) -> SearchFilters:
                 f.beds_min = f.beds_min or count
             elif c.room_type == "Bathroom":
                 f.baths_min = f.baths_min or count
+        elif t == CriterionType.OPEN_HOUSE:
+            f.open_house = True
         elif t == CriterionType.PROPERTY:
             if c.home_type and c.home_type not in f.property_types:
                 f.property_types.append(c.home_type)
@@ -822,6 +875,8 @@ async def search_properties(request: SearchRequest):
         filters_dict = (
             request.filters.model_dump(exclude_none=True) if request.filters else None
         )
+        if filters_dict is not None and filters_dict.get("open_house") == {}:
+            filters_dict["open_house"] = True  # empty window object = any upcoming open house
         if filters_dict is not None:
             # 0 / [] mean "not specified" — the response's `filters` object uses
             # those as its unset markers (client contract), so a frontend that
@@ -938,7 +993,8 @@ async def search_properties(request: SearchRequest):
             polygons=result.get("polygons"),
             detectedLocation=result.get("location_detected", False),
             filters=_extract_filters(result["parsed_query"]).model_copy(
-                update={"listing_type": result.get("listing_mode") or ""}
+                update={"listing_type": result.get("listing_mode") or "",
+                        **({"open_house": True} if (filters_dict or {}).get("open_house") else {})}
             ),
             relaxed=result.get("relaxed", []),
             softCriteria=result.get("soft_criteria", []),

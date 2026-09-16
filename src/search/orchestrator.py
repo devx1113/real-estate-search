@@ -8,11 +8,12 @@ import logging
 import asyncpg
 
 from config.settings import settings
-from src.search.open_house import listing_timezone, open_house_label
+from src.search.open_house import listing_timezone, open_house_label, open_house_where
 from src.data.feature_registry import registry
 from src.data.geolocate import locate_by_point
 from src.data.us_states import state_variants
 from src.models.search import (
+    OpenHouseCriterion,
     AreaCriterion,
     ParsedQuery,
     AreaRelationCriterion,
@@ -26,7 +27,9 @@ from src.models.search import (
 )
 from src.search.address_lookup import known_cities, match_address, parse_address
 from src.search.feature_resolver import resolve_feature_phrases
-from src.search.filter_engine import apply_hard_filters, drop_district_name_outliers
+from src.search.filter_engine import (
+    apply_hard_filters, drop_district_name_outliers, effective_open_house_filter,
+)
 from src.search.geo_search import apply_area_relation_filters, apply_proximity_filters
 from src.search.query_parser import parse_query
 from src.search.region_resolver import (
@@ -462,16 +465,6 @@ def _photo_groups(
     ]
 
 
-def _json_list(value) -> list:
-    """jsonb column value (asyncpg returns text) -> list; anything else -> []."""
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except (json.JSONDecodeError, TypeError):
-            return []
-    return value if isinstance(value, list) else []
-
-
 def _blank_to_none(value: str | None) -> str | None:
     return value.strip() if value and value.strip() else None
 
@@ -514,7 +507,6 @@ async def _load_results(pool: asyncpg.Pool, property_ids: list[int]) -> list[dic
                    r.data->>'currency'     AS currency,
                    r.data->>'homeStatus'   AS home_status,
                    r.data->>'daysOnZillow' AS days_on_market,
-                   r.data->'openHouses'    AS open_houses,
                    r.data->>'originalPhotos' AS photos_json
             FROM properties p
             LEFT JOIN raw_properties r ON r.id = p.guid
@@ -531,6 +523,15 @@ async def _load_results(pool: asyncpg.Pool, property_ids: list[int]) -> list[dic
             water_urls.setdefault(rr["property_id"], set()).add(rr["photo_url"])
 
     now = datetime.now(timezone.utc)  # one clock for the whole page's open-house labels
+    async with pool.acquire() as conn:
+        oh_rows = await conn.fetch(
+            "SELECT property_id, starts_at, ends_at FROM property_open_houses "
+            "WHERE property_id = ANY($1::int[]) AND ends_at > now()",
+            property_ids,
+        )
+    open_houses: dict[int, list[dict]] = {}
+    for o in oh_rows:
+        open_houses.setdefault(o["property_id"], []).append({"start": o["starts_at"], "end": o["ends_at"]})
     results = []
     for r in rows:
         lat, lon = r["lat"], r["lon"]
@@ -570,7 +571,7 @@ async def _load_results(pool: asyncpg.Pool, property_ids: list[int]) -> list[dic
             ),
             # Frozen at scrape time — does NOT tick daily after ingest.
             "daysOnmarket": days,
-            "openHouse": open_house_label(_json_list(r["open_houses"]), now,
+            "openHouse": open_house_label(open_houses.get(r["internal_id"]), now,
                                           listing_timezone(r["county"])),
             "yearBuilt": r["year_built"],
             "county": _blank_to_none(r["county"]),
@@ -621,6 +622,9 @@ def _criterion_labels(criterion) -> list[str]:
             val = getattr(criterion, attr)
             if val:
                 labels.append(f"{attr}={val}")
+    elif isinstance(criterion, OpenHouseCriterion):
+        parts = [f"{k}={v}" for k, v in criterion.model_dump(exclude={"type"}).items() if v not in (None, False, [])]
+        labels.append("open_house" + (f"({', '.join(parts)})" if parts else ""))
     elif isinstance(criterion, PropertyCriterion):
         for attr, op in [
             ("home_type", "="), ("min_rent", ">="), ("max_rent", "<="),
@@ -645,6 +649,7 @@ _FILTER_STEP_LABELS = [
     ("year_to", "year<={v}"),
     ("property_types", "home_type∈{v}"),
     ("financing", "financing∋{v}"),
+    ("open_house", "open_house={v}"),
 ]
 
 
@@ -715,7 +720,7 @@ async def _collect_hard_filter_steps(
             prev = count
 
     hard_types = (RoomCountCriterion, PriceCriterion, AreaCriterion,
-                  LocationCriterion, PropertyCriterion)
+                  LocationCriterion, PropertyCriterion, OpenHouseCriterion)
     for c in criteria:
         if not isinstance(c, hard_types):
             continue
@@ -1194,7 +1199,25 @@ async def search(
     # deterministic and disjoint, slice BEFORE the heavy raw-JSON/photos join —
     # page 2+ skips that cost entirely. Pins stay un-paginated for the map.
     # Ranking: homes matching more soft wishes first, then id (deterministic pages).
-    property_ids = sorted(property_ids, key=lambda pid: (-len(soft_hits.get(pid, [])), pid))
+    # Open-house searches: soonest matching open house first.
+    oh_crit = (effective_open_house_filter(filters, parsed_query.criteria)
+               or next((c for c in parsed_query.criteria if isinstance(c, OpenHouseCriterion)), None))
+    next_open: dict[int, datetime] = {}
+    if oh_crit is not None and property_ids:
+        where, oh_params, _ = open_house_where(oh_crit, 2, id_col="p.id", county_col="p.county")
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                f"SELECT p.id, min(oh.starts_at) AS first_start FROM properties p "
+                f"JOIN property_open_houses oh ON oh.property_id = p.id "
+                f"WHERE p.id = ANY($1::int[]) AND {where} GROUP BY p.id",
+                list(property_ids), *oh_params,
+            )
+        next_open = {r["id"]: r["first_start"] for r in rows}
+    far = datetime.max.replace(tzinfo=timezone.utc)
+    property_ids = sorted(
+        property_ids,
+        key=lambda pid: (next_open.get(pid, far), -len(soft_hits.get(pid, [])), pid),
+    )
     total_count = len(property_ids)
     page_ids = property_ids[(page - 1) * page_size : page * page_size]
 

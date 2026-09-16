@@ -301,7 +301,20 @@ def _open_houses(d: dict, sf: dict) -> list[dict]:
                     .replace(tzinfo=local_tz).isoformat()
             except (ValueError, TypeError):
                 continue
-        out.append({"start": str(start), "end": str(end)})
+        try:  # keep only real timestamps — the DB casts these
+            datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+            datetime.fromisoformat(str(end).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        host = None
+        for info in e.get("AdditionalInfo") or []:
+            if isinstance(info, dict):
+                name = _ci(info).get("Hosted By")
+                if isinstance(name, str) and name.strip():
+                    host = name.strip()
+                    break
+        out.append({"start": str(start), "end": str(end), "host": host,
+                    "livestream": bool(e.get("Livestream"))})
     return out
 
 

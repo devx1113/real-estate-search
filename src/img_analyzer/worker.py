@@ -30,7 +30,7 @@ from src.img_analyzer.db_ingest import (
     refresh_property_room_counts,
     update_property_scalars,
     update_property_with_children,
-    ensure_property_columns, refresh_home_status,
+    ensure_property_columns, refresh_home_status, refresh_open_houses,
 )
 from src.img_analyzer.models import Photo, PhotoResult, PropertyItem
 from src.img_analyzer.raw_db import (
@@ -425,6 +425,7 @@ async def _insert_primary_full(conn, item: dict) -> None:
     await _insert_children(conn, prop_id, rooms_from_photos, _extract_schools(item))
     await assign_region_ids(conn, prop_id)
     await refresh_home_status(conn, prop_id)
+    await refresh_open_houses(conn, prop_id)
 
 
 MAX_INGEST_ATTEMPTS = 5

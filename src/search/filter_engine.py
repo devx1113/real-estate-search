@@ -7,16 +7,41 @@ import asyncpg
 
 from src.data.us_states import country_variants, state_variants
 from src.search.region_resolver import region_membership_sql, region_property_ids, search_area_target
+from src.search.open_house import open_house_exists_sql
 from src.models.search import (
     AreaCriterion,
     Criterion,
     LocationCriterion,
+    OpenHouseCriterion,
     PriceCriterion,
     PropertyCriterion,
     RoomCountCriterion,
 )
 
 logger = logging.getLogger(__name__)
+
+def open_house_criterion_from_filter(value) -> OpenHouseCriterion:
+    """Request filter `open_house` (true, or an object with OpenHouseCriterion's
+    fields) -> criterion. The request model has already validated the values."""
+    if isinstance(value, dict):
+        return OpenHouseCriterion(**{k: v for k, v in value.items() if k != "type"})
+    return OpenHouseCriterion()
+
+
+def effective_open_house_filter(filters: dict | None, criteria: list) -> OpenHouseCriterion | None:
+    """The request filter's open-house condition, or None when it adds nothing.
+    A bare `true` only says "must have an open house": when the typed query already
+    parsed an open-house criterion (possibly with a date/time window), the parsed
+    one applies — the frontend echoes response.filters.open_house=true back, and
+    that echo must not widen "open houses this weekend" to every upcoming date.
+    A window object is explicit and always wins."""
+    value = (filters or {}).get("open_house")
+    if not value:
+        return None
+    if value is True and any(isinstance(c, OpenHouseCriterion) for c in criteria):
+        return None
+    return open_house_criterion_from_filter(value)
+
 
 def _word_match_pattern(value: str) -> str:
     """Case-insensitive WHOLE-WORD regex for a place name: 'viera' must match
@@ -66,7 +91,7 @@ async def apply_hard_filters(
     hard_criteria = [
         c for c in criteria
         if isinstance(c, (RoomCountCriterion, PriceCriterion, AreaCriterion,
-                          LocationCriterion, PropertyCriterion))
+                          LocationCriterion, PropertyCriterion, OpenHouseCriterion))
     ]
 
     # Which criterion+field the polygon replaces (the same target the region was
@@ -176,6 +201,12 @@ async def apply_hard_filters(
             params.append(filters["property_types"])
             param_idx += 1
             covered.add("property_types")
+        oh_filter = effective_open_house_filter(filters, criteria)
+        if oh_filter is not None:
+            cond, oh_params, param_idx = open_house_exists_sql(oh_filter, param_idx)
+            conditions.append(cond)
+            params.extend(oh_params)
+            covered.add("open_house")
         if filters.get("financing"):
             conditions.append(f"financing && ${param_idx}::text[]")
             params.append(filters["financing"])
@@ -308,6 +339,12 @@ async def apply_hard_filters(
                 conditions.append(f"LOWER(country) = ANY(${param_idx}::text[])")
                 params.append(cv)
                 param_idx += 1
+
+        elif isinstance(criterion, OpenHouseCriterion):
+            if "open_house" not in covered:
+                cond, oh_params, param_idx = open_house_exists_sql(criterion, param_idx)
+                conditions.append(cond)
+                params.extend(oh_params)
 
         elif isinstance(criterion, PropertyCriterion):
             if criterion.home_type and "property_types" not in covered:

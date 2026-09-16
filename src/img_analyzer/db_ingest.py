@@ -393,7 +393,19 @@ async def ensure_property_columns(conn) -> None:
     """Self-migrating additions to `properties` (the schema file only runs on a
     fresh database). home_status mirrors the raw record's homeStatus so search can
     split sale (FOR_SALE/PENDING) from rent (FOR_RENT) with a plain indexed column.
-    Idempotent; the backfill touches only rows still NULL."""
+    Idempotent; the backfill touches only rows still NULL. The app and the worker
+    both run this at startup, so it is serialized with a SESSION advisory lock —
+    not one transaction: ALTER TABLE takes an exclusive lock on properties even when
+    the column exists, and each statement must commit (and release it) at once
+    instead of blocking live searches for the whole migration."""
+    await conn.execute("SELECT pg_advisory_lock(724113)")
+    try:
+        await _ensure_property_columns_locked(conn)
+    finally:
+        await conn.execute("SELECT pg_advisory_unlock(724113)")
+
+
+async def _ensure_property_columns_locked(conn) -> None:
     await conn.execute("ALTER TABLE properties ADD COLUMN IF NOT EXISTS home_status TEXT")
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_properties_home_status ON properties(home_status)"
@@ -406,6 +418,35 @@ async def ensure_property_columns(conn) -> None:
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_properties_city_region_ids ON properties USING GIN (city_region_ids)"
     )
+    # Open houses (2026-09-16): one row per event, searchable by local date/time.
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS property_open_houses (
+            id          BIGSERIAL PRIMARY KEY,
+            property_id INTEGER NOT NULL REFERENCES properties(id) ON DELETE CASCADE,
+            starts_at   TIMESTAMPTZ NOT NULL,
+            ends_at     TIMESTAMPTZ NOT NULL,
+            host        TEXT,
+            livestream  BOOLEAN NOT NULL DEFAULT FALSE
+        )""")
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_open_houses_property ON property_open_houses(property_id)"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_open_houses_ends ON property_open_houses(ends_at)"
+    )
+    n = await conn.fetchval(
+        f"""
+        WITH filled AS (
+            INSERT INTO property_open_houses (property_id, starts_at, ends_at, host, livestream)
+            {_OPEN_HOUSE_ROWS_SQL}
+              AND NOT EXISTS (SELECT 1 FROM property_open_houses x WHERE x.property_id = p.id)
+            RETURNING 1
+        )
+        SELECT count(*) FROM filled
+        """
+    )
+    if n:
+        logger.info("property_open_houses backfilled with %d event(s)", n)
     n = await conn.fetchval(
         """
         WITH filled AS (
@@ -419,6 +460,33 @@ async def ensure_property_columns(conn) -> None:
     )
     if n:
         logger.info("properties.home_status backfilled for %d row(s)", n)
+
+
+# Events of the stored raw record, as property_open_houses rows (the adapter writes
+# ISO timestamps; the pattern guard keeps a malformed value from failing the ingest).
+_OPEN_HOUSE_ROWS_SQL = r"""
+    SELECT p.id, (e->>'start')::timestamptz, (e->>'end')::timestamptz,
+           nullif(trim(e->>'host'), ''),
+           coalesce(CASE WHEN jsonb_typeof(e->'livestream') = 'boolean' THEN (e->>'livestream')::boolean END, false)
+    FROM properties p
+    JOIN raw_properties r ON r.id = p.guid
+    CROSS JOIN LATERAL jsonb_array_elements(
+        CASE WHEN jsonb_typeof(r.data->'openHouses') = 'array' THEN r.data->'openHouses' ELSE '[]'::jsonb END
+    ) e
+    WHERE jsonb_typeof(e) = 'object'
+      AND (e->>'start') ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}'
+      AND (e->>'end')   ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}'
+"""
+
+
+async def refresh_open_houses(conn, prop_id: int) -> None:
+    """Replace the property's open-house rows with the events of its raw record."""
+    await conn.execute("DELETE FROM property_open_houses WHERE property_id = $1", prop_id)
+    await conn.execute(
+        "INSERT INTO property_open_houses (property_id, starts_at, ends_at, host, livestream) "
+        + _OPEN_HOUSE_ROWS_SQL + " AND p.id = $1",
+        prop_id,
+    )
 
 
 async def refresh_home_status(conn, prop_id: int) -> None:
@@ -652,6 +720,7 @@ async def update_property_scalars(
     # Re-assign region ids (coordinates or the raw record may have moved).
     await assign_region_ids(conn, existing_id)
     await refresh_home_status(conn, existing_id)
+    await refresh_open_houses(conn, existing_id)
 
 
 async def update_property_metadata(
@@ -703,6 +772,7 @@ async def update_property_metadata(
     # Re-assign region ids (coordinates or the raw record may have moved).
     await assign_region_ids(conn, existing_id)
     await refresh_home_status(conn, existing_id)
+    await refresh_open_houses(conn, existing_id)
 
 
 async def update_property_with_children(
