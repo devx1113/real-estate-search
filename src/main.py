@@ -523,9 +523,9 @@ class BriefProperty(BaseModel):
     yearBuilt: int | None = None
     county: str | None = None
     lotAreaValue: float | None = None  # square feet (acreage converted at ingest)
-    # Next open house as display text, computed per request in US Eastern time:
+    # Next open house as display text, computed per request in the listing's local US time:
     # "Open House until 3:00 PM" (happening now), "Open House Today, 12:00 PM – 3:00 PM",
-    # "Open House: Sat, Sep 20, 12:00 PM – 3:00 PM"; null when none is upcoming.
+    # "Open: Sat, 12:00 PM – 3:00 PM (09/20)"; null when none is upcoming.
     openHouse: str | None = None
     # The query's soft wishes ("great kitchen", "feels private") this home
     # satisfies — results are ranked by how many; lets the UI badge them.

@@ -9,7 +9,7 @@ zoneinfo):
 
   happening now      -> "Open House until 3:00 PM"
   later today        -> "Open House Today, 12:00 PM – 3:00 PM"
-  a later day        -> "Open House: Sat, Sep 20, 12:00 PM – 3:00 PM"
+  a later day        -> "Open: Sat, 12:00 PM – 3:00 PM (09/20)"
   nothing upcoming   -> None
 
 Only the FIRST event that has not ended is described; ended events are ignored.
@@ -75,4 +75,4 @@ def open_house_label(events, now: datetime | None = None, tz: ZoneInfo = LISTING
         return f"Open House until {_clock(le)}"
     if ls.date() == ln.date():
         return f"Open House Today, {_clock(ls)} – {_clock(le)}"
-    return f"Open House: {_day(ls)}, {_clock(ls)} – {_clock(le)}"
+    return f"Open: {ls:%a}, {_clock(ls)} – {_clock(le)} ({ls:%m/%d})"
