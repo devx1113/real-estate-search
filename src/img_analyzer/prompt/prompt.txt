@@ -9,6 +9,7 @@
               Normalize related colors: ivory/cream/eggshell → white, navy/teal/turquoise → blue, tan/khaki/taupe → beige, charcoal/silver → gray, mahogany/walnut/oak/wood-tone → brown, sage/olive/forest → green, burgundy/maroon/coral → red, mustard → yellow, lavender/violet → purple, salmon/rose → pink.
               If no color clearly dominates, choose the single most prevalent one (after applying the rules above). If the photo is ambiguous, return "Color": "Unknown".
             - Examine visual details to extract key search keywords that describe the room’s features. Each feature should be a concise term that a homebuyer might use in a search (e.g., "granite countertops", "hardwood floors", "soaking tub", "vaulted ceiling"). Do not describe features in sentence form; use discrete, searchable keywords only.
+              Tag only what IS present: never emit a keyword for something absent, missing, omitted, or "not visible" (e.g. never "ceiling fan not visible", "shutters absent") — a keyword must name a feature the buyer would get.
               COLOR HANDLING — TWO DISTINCT THINGS:
                 1. The room's overall dominant color goes in the "Color" field (one of the 13 palette colors) — ignoring the ceiling, and for a Kitchen using the cabinet color per the KITCHEN RULE above.
                 2. When a SPECIFIC OBJECT has a notable color, KEEP that color in its feature keyword,

@@ -26,7 +26,7 @@ from src.models.search import (
     RoomCountCriterion,
 )
 from src.search.address_lookup import known_cities, match_address, parse_address
-from src.search.feature_resolver import resolve_feature_phrases
+from src.search.feature_resolver import drop_non_asserting, resolve_feature_phrases
 from src.search.filter_engine import (
     apply_hard_filters, drop_district_name_outliers, effective_open_house_filter,
 )
@@ -1091,12 +1091,19 @@ async def search(
                 ws = registry.get_feature_alternatives(fc.feature)
                 if ws:
                     merged = set(alternatives.get(fc.feature, [])) | set(ws)
-                    alternatives[fc.feature] = sorted(merged)
+                    # The resolver already guarded its list; guard the union too, or
+                    # word-subset tags such as "ceiling fan not visible" and
+                    # "ceiling fan prep" re-enter and "without fan" excludes homes
+                    # that have no fan.
+                    alternatives[fc.feature] = drop_non_asserting(fc.feature, sorted(merged))
         else:
             # Legacy: deterministic word-subset alternatives from the registry.
-            alternatives = _build_alternatives(
-                feature_criteria, parsed_query.reconstructed_queries
-            )
+            alternatives = {
+                phrase: drop_non_asserting(phrase, alts)
+                for phrase, alts in _build_alternatives(
+                    feature_criteria, parsed_query.reconstructed_queries
+                ).items()
+            }
         if alternatives:
             logger.info(f"Feature alternatives: {alternatives}")
         # Sort positives-first, base-before-modifier for logical debug narration (set ops commute, so result is identical).

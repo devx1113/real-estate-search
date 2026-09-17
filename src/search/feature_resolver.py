@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 
 from config.settings import settings
 from src.llm_client import embed_texts, get_query_client
@@ -230,17 +231,88 @@ async def resolve_feature_phrases(
     }
 
 
-# Tags that describe the ABSENCE or mere possibility of a feature. Embedding
-# similarity happily returns "needs kitchen renovation" for "renovated kitchen"
-# and "water views potential" for "water views" — text-close, meaning-opposite.
-_NEGATIVE_POLARITY = ("needs ", "need ", "potential", "project", "unfinished",
-                      "outdated", "dated ", "damaged", "to be ", "not ")
+# ---------------------------------------------------------------------------
+# Tags that mention the feature without asserting it. Embedding similarity (and
+# the word-subset merge in the orchestrator) return them for the phrase:
+#   opposite polarity  "needs kitchen renovation" for "renovated kitchen"
+#   provision only     "ceiling fan prep", "washer hookup" — wired for it, not there
+#   absence            "no pool", "carpet-free bedroom", "screen-ready porch"
+# For a positive search they are false matches; for a negated one ("without fan")
+# each wrongly excludes a home that has no fan (2026-09-17: 14 homes on
+# production). The guard runs at resolve time and again after the orchestrator's
+# merge, so it needs no cache invalidation. Pure absence tags ("ceiling fan not
+# visible") are additionally dropped at ingest — db_ingest.drop_absence_tags.
+_POLARITY_RE = re.compile(
+    r"\b(?:needs?|potential|project|unfinished|outdated|dated|damaged|to be|not|"
+    r"absent|omitted|missing|unseen|room for|space for|ready for|wired for|plumbed for)\b"
+)
+# Trailing marker: the tag describes the PROVISION for X, not X itself.
+_PROVISION_RE = re.compile(
+    r"\s(?:prep|preparation|pre-?wired?|rough-in|roughed-in|hook-?ups?|ready|stub-?outs?)$"
+)
+_PROVISION_WORD_RE = re.compile(r"\b(?:prep|preparation|pre-?wired?|rough-in|hook-?ups?|ready|stub-?outs?)\b")
+# "no X" / "without X" / "X-free" / "X-ready Y": X is absent. Dropped only when X
+# overlaps the phrase, so "no rear neighbors" stays a match for "privacy",
+# "panel-ready refrigerator" stays a refrigerator and "step-free shower" a shower.
+# The missing thing ends at a location qualifier: "no structures on lot" negates
+# "structures", not the lot; "no rear neighbors across lake" negates the neighbors.
+_ABSENT_HEAD_RE = re.compile(
+    r"\b(?:no|without|lacks|lacking|free of)\s+(.+?)"
+    r"(?:\s+(?:on|in|at|across|behind|near|from|to|by|over|under|along|beside|next to)\b.*)?$"
+)
+_ABSENT_SUFFIX_RE = re.compile(r"([a-z']+)-(?:free|ready)\b")
+_ABSENT_MARK_RE = re.compile(r"\b(?:no|without|lacks|lacking|free of)\b|-(?:free|ready)\b")
+# "-free" compounds that praise rather than negate.
+_FREE_IS_POSITIVE = {"maintenance", "hassle", "worry", "care", "stress", "barrier", "step"}
+_STOP = {"a", "an", "the", "of", "with", "and", "or", "in", "on", "to", "for", "at"}
 
 
-def _drop_opposite_polarity(phrase: str, alts: list[str]) -> list[str]:
-    """Remove alternatives whose wording negates the phrase, unless the user's own
-    phrase carries that wording (someone searching "needs renovation" keeps them)."""
-    pl = f" {phrase.strip().lower()} "
-    if any(m.strip() and m.strip() in pl for m in _NEGATIVE_POLARITY):
-        return alts
-    return [a for a in alts if not any(m in f" {a.lower()} " for m in _NEGATIVE_POLARITY)]
+def _stems(text: str) -> set[str]:
+    out = set()
+    for w in re.findall(r"[a-z']+", text.lower()):
+        if w in _STOP or len(w) < 2:
+            continue
+        w = w.rstrip("s")
+        for suf in ("ing", "ed"):
+            if w.endswith(suf) and len(w) - len(suf) >= 3:
+                w = w[: -len(suf)]
+                break
+        out.add(w)
+    return out
+
+
+def _overlap(a: set[str], b: set[str]) -> bool:
+    return any(x == y or (min(len(x), len(y)) >= 4 and (x.startswith(y) or y.startswith(x)))
+               for x in a for y in b)
+
+
+def drop_non_asserting(phrase: str, alts: list[str]) -> list[str]:
+    """Remove alternatives that do not assert the phrase's feature (opposite
+    polarity, provision-only, absence). Each rule is skipped when the user's own
+    phrase carries that wording: "needs renovation", "washer hookup" and
+    "no rear neighbors" keep their tags."""
+    pl = phrase.strip().lower()
+    check_polarity = not _POLARITY_RE.search(pl)
+    check_provision = not _PROVISION_WORD_RE.search(pl)
+    check_absence = not _ABSENT_MARK_RE.search(pl)
+    pstems = _stems(pl)
+    out: list[str] = []
+    for a in alts:
+        al = a.lower()
+        if check_polarity and _POLARITY_RE.search(al):
+            continue
+        if check_provision and _PROVISION_RE.search(al) and not al.startswith(("move-in", "move in", "turnkey")):
+            continue
+        if check_absence:
+            m = _ABSENT_HEAD_RE.search(al)
+            if m and _overlap(_stems(m.group(1)), pstems):
+                continue
+            if any(x not in _FREE_IS_POSITIVE and _overlap(_stems(x), pstems)
+                   for x in _ABSENT_SUFFIX_RE.findall(al)):
+                continue
+        out.append(a)
+    return out
+
+
+# Backwards-compatible name.
+_drop_opposite_polarity = drop_non_asserting

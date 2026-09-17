@@ -2,6 +2,7 @@
 
 import logging
 import math
+import re
 from collections import defaultdict
 
 import asyncpg
@@ -126,12 +127,33 @@ def _ensure_community_pool_tag(room_type: str, features: list) -> list:
     return features
 
 
+# The vision model sometimes names what a photo does NOT show ("ceiling fan not
+# visible", "shutters absent", "ceiling fan light omitted"). Such a tag says nothing
+# about the home and is noise for every search: it matches the words of a positive
+# search and makes "without fan" exclude a home that has no fan. Dropped before
+# storage on every write path (full ingest and partial photo update); existing rows
+# are cleaned by src.data.cleanup_absence_tags. Deliberately narrow: "no rear
+# neighbors", "no hoa" and "carpet-free bedroom" describe real attributes and stay.
+_ABSENCE_TAG_RE = re.compile(
+    r"\b(?:not (?:visible|shown|present|pictured|seen|included|installed)|"
+    r"absent|omitted|missing|unseen|out of (?:view|frame))\b",
+    re.IGNORECASE,
+)
+
+
+def drop_absence_tags(features: list) -> list:
+    """Remove tags stating a feature is absent or not visible (see _ABSENCE_TAG_RE)."""
+    return [f for f in (features or []) if not _ABSENCE_TAG_RE.search(str(f))]
+
+
 def _build_rooms_from_photos(photos: list[dict]) -> dict[str, list[dict]]:
     """Group features by RoomType → {room_type: [{"features","color","photo_url"}]}; unusable results become empty "Unknown" stubs to claim their URL."""
     rooms: dict[str, list[dict]] = defaultdict(list)
     for photo in photos:
         room_type = photo.get("RoomType", "Unknown")
-        features = _ensure_community_pool_tag(room_type, photo.get("Features", []))
+        features = drop_absence_tags(
+            _ensure_community_pool_tag(room_type, photo.get("Features", []) or [])
+        )
         color = photo.get("Color")
         if isinstance(color, str):
             color = color.strip().lower() or None

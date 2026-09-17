@@ -24,6 +24,7 @@ from src.img_analyzer.db_ingest import (
     _canonical_photo_url,
     _ensure_community_pool_tag,
     _extract_property_fields,
+    drop_absence_tags,
     _extract_schools,
     _get_room_counts,
     _insert_children,
@@ -300,14 +301,15 @@ async def _process_partial(
                 url = _canonical_photo_url(photo)
                 if not url:
                     continue  # no JPEG URL — untrackable
-                if result.room_type and result.room_type != "Unknown" and result.features:
+                # Same community-pool backstop and absence-tag filter as the
+                # full-ingest path — partial photo updates must not bypass them.
+                features = drop_absence_tags(
+                    _ensure_community_pool_tag(result.room_type, list(result.features or []))
+                )
+                if result.room_type and result.room_type != "Unknown" and features:
                     new_rows.setdefault(result.room_type, []).append({
                         "photo_url": url,
-                        # Same community-pool backstop as the full-ingest path —
-                        # partial photo updates must not bypass it.
-                        "features": _ensure_community_pool_tag(
-                            result.room_type, list(result.features)
-                        ),
+                        "features": features,
                         "color": result.color,
                     })
                 else:
