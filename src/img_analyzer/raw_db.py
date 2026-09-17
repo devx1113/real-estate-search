@@ -175,8 +175,17 @@ SKIPPED_NOT_FOR_SALE = "skipped_not_for_sale"
 _PENDING_STATUSES = ("unprocessed", "partial_image_only_processed", "image_only_processed")
 
 
-async def prune_non_for_sale(conn) -> tuple[int, int]:
-    """Enforce the catalog-status rule (FOR_SALE/PENDING); returns (properties_deleted, rows_skipped).
+async def prune_non_for_sale(conn, since=None) -> tuple[int, int]:
+    """Enforce the catalog-status rule (CATALOG_STATUSES); returns (properties_deleted, rows_skipped).
+
+    since: None = full pass; otherwise only raw rows written after this instant
+    (updated_at: NOT NULL DEFAULT NOW(), bumped by every upload, park and worker
+    status change; indexed). A listing leaves the catalog through a raw write, so
+    an incremental pass catches it. The one exception is part 2 when the OLD
+    GUID's property is created after the newer record was last written (its
+    vision batch finished late); the worker's periodic full pass covers that.
+    Before 2026-09-17 every pass was full: three reads of the ~200 MB jsonb table
+    every 5 s, about half of one database CPU, while deleting nothing.
 
     Three parts, all idempotent and cheap when there is nothing to do:
       1. DELETE properties whose OWN raw record has left the catalog statuses — a
@@ -198,12 +207,13 @@ async def prune_non_for_sale(conn) -> tuple[int, int]:
             DELETE FROM properties p
             USING raw_properties r
             WHERE r.id = p.guid
+              AND ($2::timestamptz IS NULL OR r.updated_at > $2)
               AND coalesce(r.data->>'homeStatus', '') <> ALL($1::text[])
             RETURNING p.id
         )
         SELECT count(*) FROM gone
         """,
-        list(CATALOG_STATUSES),
+        list(CATALOG_STATUSES), since,
     )
     superseded = await conn.fetchval(
         """
@@ -215,12 +225,13 @@ async def prune_non_for_sale(conn) -> tuple[int, int]:
               AND newer.id <> own.id
               AND newer.data->>'zpid' = p.zpid::text
               AND newer.created_at > own.created_at
+              AND ($2::timestamptz IS NULL OR newer.updated_at > $2)
               AND coalesce(newer.data->>'homeStatus', '') <> ALL($1::text[])
             RETURNING p.id
         )
         SELECT count(*) FROM gone
         """,
-        list(CATALOG_STATUSES),
+        list(CATALOG_STATUSES), since,
     )
     deleted = (deleted or 0) + (superseded or 0)
     skipped = await conn.fetchval(
@@ -229,6 +240,7 @@ async def prune_non_for_sale(conn) -> tuple[int, int]:
             UPDATE raw_properties
             SET status = $1, updated_at = NOW()
             WHERE status = ANY($2)
+              AND ($4::timestamptz IS NULL OR updated_at > $4)
               AND coalesce(data->>'homeStatus', '') <> ALL($3::text[])
             RETURNING id
         )
@@ -237,6 +249,7 @@ async def prune_non_for_sale(conn) -> tuple[int, int]:
         SKIPPED_NOT_FOR_SALE,
         list(_PENDING_STATUSES),
         list(CATALOG_STATUSES),
+        since,
     )
     if deleted or skipped:
         logger.info(

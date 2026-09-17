@@ -13,6 +13,10 @@ class Settings(BaseSettings):
 
     # /search feature retrieval: True → embedding top-K + GPT filter; False → legacy dump-all-features; flag enables instant rollback.
     search_use_embedding_retrieval: bool = True
+    # Candidates per phrase for the LLM feature filter. Keep 200: at 100 the filter ran
+    # about 2x faster but lost real matches ranked 101-200 ("canal view", "waterfront"
+    # for "water view": 3,139 -> 2,427 homes, production 2026-09-17), and a phrase's
+    # resolution is cached permanently.
     search_embedding_top_k: int = 200
 
     # OpenAI Batch API for photo analysis (50% cost, async ≤24h turnaround).
@@ -65,7 +69,10 @@ class Settings(BaseSettings):
 
     # env_ignore_empty: a blank line in .env (e.g. `VISION_USE_BATCH=` copied from
     # .env.example) means "use the default" instead of crashing bool/int parsing.
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "env_ignore_empty": True}
+    # extra=ignore: .env is shared with docker compose, whose own variables
+    # (PG_SHARED_BUFFERS, ...) would otherwise fail validation in host-run scripts.
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "env_ignore_empty": True,
+                    "extra": "ignore"}
 
 
 settings = Settings()

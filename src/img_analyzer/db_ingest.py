@@ -407,6 +407,10 @@ async def ensure_property_columns(conn) -> None:
 
 async def _ensure_property_columns_locked(conn) -> None:
     await conn.execute("ALTER TABLE properties ADD COLUMN IF NOT EXISTS home_status TEXT")
+    # Incremental catalog prune walks raw rows by write time.
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_raw_properties_updated_at ON raw_properties(updated_at)"
+    )
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_properties_home_status ON properties(home_status)"
     )

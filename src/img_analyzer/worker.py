@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 
 import asyncpg
 
@@ -46,6 +47,21 @@ logger = logging.getLogger(__name__)
 WORKER_BATCH_SIZE = 1            # rows processed in parallel per iteration
 WORKER_IDLE_SLEEP_SECONDS = 5    # sleep when no work
 WORKER_ERROR_SLEEP_SECONDS = 10  # sleep after an errored iteration
+
+# Catalog prune schedule. Incremental passes only look at raw rows written since the
+# previous pass started, minus an overlap for in-flight commits (prune is idempotent).
+# A full pass runs at process start and then every _PRUNE_FULL_EVERY as a safety net
+# for the one case a raw write does not cover: a property created from an OLD GUID's
+# vision batch after a newer off-catalog record for the same listing was already seen.
+# The worker loops without sleeping while it has work, so passes are also spaced at
+# least _PRUNE_MIN_INTERVAL apart; skipping one is safe because the claim and batch
+# paths already exclude off-catalog rows (no vision spend on them meanwhile).
+_PRUNE_OVERLAP = timedelta(minutes=2)
+_PRUNE_FULL_EVERY = timedelta(minutes=30)
+_PRUNE_MIN_INTERVAL = timedelta(seconds=5)
+_prune_watermark: datetime | None = None   # start of the last successful pass - overlap
+_last_full_prune: datetime | None = None   # start of the last successful full pass
+_last_prune_attempt: datetime | None = None
 
 # Background POI auto-refresh: after new properties land, import POIs for any
 # newly-seen county (debounced — one task at a time; no-op when all covered).
@@ -558,17 +574,39 @@ async def _batch_step(pool: asyncpg.Pool) -> int:
     return activity
 
 
+async def _catalog_prune(pool: asyncpg.Pool) -> None:
+    """Run one catalog prune pass: full at process start and every _PRUNE_FULL_EVERY,
+    otherwise incremental from the watermark; skipped if the last attempt was under
+    _PRUNE_MIN_INTERVAL ago. A failed pass leaves the watermark and the full-pass
+    clock untouched, so the next pass re-covers the same window."""
+    global _prune_watermark, _last_full_prune, _last_prune_attempt
+    pass_started = datetime.now(timezone.utc)
+    if _last_prune_attempt is not None and pass_started - _last_prune_attempt < _PRUNE_MIN_INTERVAL:
+        return
+    _last_prune_attempt = pass_started
+    full = (
+        _prune_watermark is None
+        or _last_full_prune is None
+        or pass_started - _last_full_prune >= _PRUNE_FULL_EVERY
+    )
+    try:
+        async with pool.acquire() as conn:
+            await prune_non_for_sale(conn, since=None if full else _prune_watermark)
+    except Exception as e:  # noqa: BLE001 — never let the prune stall ingestion
+        logger.warning(f"Worker: catalog prune failed: {e}")
+        return
+    _prune_watermark = pass_started - _PRUNE_OVERLAP
+    if full:
+        _last_full_prune = pass_started
+
+
 async def _worker_iteration(pool: asyncpg.Pool) -> tuple[int, int]:
     """Process one iteration; returns (claimed, succeeded), claimed=0 meaning no work.
     Batch mode is BATCH-EXCLUSIVE: all photo analysis flows through _batch_step, and the
     sync claim below only handles metadata-only rows (image_only_processed)."""
-    # Catalog rule (FOR_SALE/PENDING): drop listings that sold or otherwise left the
-    # catalog since ingest and park their pending rows BEFORE any vision work below.
-    try:
-        async with pool.acquire() as conn:
-            await prune_non_for_sale(conn)
-    except Exception as e:  # noqa: BLE001 — never let the prune stall ingestion
-        logger.warning(f"Worker: catalog prune failed: {e}")
+    # Catalog rule (FOR_SALE/PENDING/FOR_RENT): drop listings that left the catalog
+    # since ingest and park their pending rows BEFORE any vision work below.
+    await _catalog_prune(pool)
 
     batch_activity = 0
     if settings.vision_use_batch:

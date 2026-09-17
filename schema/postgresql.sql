@@ -147,6 +147,7 @@ CREATE TABLE raw_properties (
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX idx_raw_properties_status ON raw_properties(status);
+CREATE INDEX idx_raw_properties_updated_at ON raw_properties(updated_at);  -- incremental catalog prune
 -- The catalog carries FOR_SALE and PENDING listings; the prune/claim paths filter on this expression.
 CREATE INDEX idx_raw_properties_home_status ON raw_properties ((data->>'homeStatus'));
 

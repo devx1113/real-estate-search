@@ -4,6 +4,21 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.db
+    # Memory tuning (2026-09-17): the default 128 MB shared_buffers gave a 55% cache
+    # hit ratio against ~900 MB of hot data. Sized per host via .env
+    # (PG_SHARED_BUFFERS / PG_EFFECTIVE_CACHE_SIZE / PG_WORK_MEM); defaults suit a
+    # small dev box, the VPS sets 2GB / 5GB / 16MB.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${PG_SHARED_BUFFERS:-512MB}
+      - -c
+      - effective_cache_size=${PG_EFFECTIVE_CACHE_SIZE:-2GB}
+      - -c
+      - work_mem=${PG_WORK_MEM:-8MB}
+    # Parallel hash joins allocate in /dev/shm; Docker's 64 MB default fails those
+    # queries ("No space left on device") once work_mem is raised. Used on demand only.
+    shm_size: 1gb
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
